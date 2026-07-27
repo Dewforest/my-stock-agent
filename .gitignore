@@ -5,5 +5,10 @@ __pycache__/
 .coverage
 htmlcov/
 *.duckdb
+*.duckdb.wal
 .env
+.env.*
+*.env
+!.env.example
+!.env.template
 .DS_Store
