@@ -15,6 +15,8 @@ from pydantic import (
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 PositiveDecimal = Annotated[Decimal, Field(gt=0)]
 NonNegativeDecimal = Annotated[Decimal, Field(ge=0)]
+StrictPositiveDecimal = Annotated[Decimal, Field(strict=True, gt=0)]
+StrictNonNegativeDecimal = Annotated[Decimal, Field(strict=True, ge=0)]
 UnitDecimal = Annotated[Decimal, Field(ge=0, le=1)]
 PercentageInt = Annotated[int, Field(ge=0, le=100)]
 
@@ -59,11 +61,11 @@ class Bar(_ImmutableModel):
     symbol: NonEmptyStr
     market: Market
     session_date: date
-    open: PositiveDecimal
-    high: PositiveDecimal
-    low: PositiveDecimal
-    close: PositiveDecimal
-    volume: NonNegativeDecimal
+    open: StrictPositiveDecimal
+    high: StrictPositiveDecimal
+    low: StrictPositiveDecimal
+    close: StrictPositiveDecimal
+    volume: StrictNonNegativeDecimal
     available_at: AwareDatetime
 
     @model_validator(mode="after")

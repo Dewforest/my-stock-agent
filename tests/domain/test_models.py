@@ -182,6 +182,21 @@ def test_bar_preserves_decimal_values() -> None:
     assert isinstance(bar.volume, Decimal)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("open", 100.0),
+        ("high", 110.0),
+        ("low", 90.0),
+        ("close", 105.0),
+        ("volume", 1000000.0),
+    ],
+)
+def test_bar_rejects_float_values(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        make_bar(**{field: value})
+
+
 def test_bar_rejects_naive_available_at() -> None:
     with pytest.raises(ValidationError):
         make_bar(available_at=datetime(2026, 7, 27, 21))
