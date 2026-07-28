@@ -13,6 +13,7 @@ from stock_agent.account import (
     CashInitialized,
     EventReversed,
     LedgerEvent,
+    PortfolioLedger,
     PositionMarked,
     SellFilled,
 )
@@ -312,4 +313,6 @@ def test_account_exports_exact_public_contract() -> None:
         "PositionMarked",
         "EventReversed",
         "LedgerEvent",
+        "PortfolioLedger",
     ]
+    assert account.PortfolioLedger is PortfolioLedger
