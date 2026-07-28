@@ -3,6 +3,7 @@ from decimal import (
     MAX_EMAX,
     MAX_PREC,
     MIN_EMIN,
+    ROUND_CEILING,
     ROUND_HALF_EVEN,
     Clamped,
     Context,
@@ -153,7 +154,9 @@ def _sector_room(
     same_sector_value = Decimal(0)
     for market_value in same_sector_values:
         same_sector_value = arithmetic.add(same_sector_value, market_value)
-    other_sector_weight = arithmetic.divide(same_sector_value, portfolio.nav)
+    ratio_context = arithmetic.copy()
+    ratio_context.rounding = ROUND_CEILING
+    other_sector_weight = ratio_context.divide(same_sector_value, portfolio.nav)
     weight_context = _arithmetic_context_for(
         _SECTOR_EXPOSURE_LIMIT, other_sector_weight
     )

@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from decimal import MAX_EMAX, ROUND_UP, Decimal, Inexact, localcontext
+from decimal import MAX_EMAX, ROUND_HALF_EVEN, ROUND_UP, Decimal, Inexact, localcontext
 
 from stock_agent.domain import (
     Currency,
@@ -108,6 +108,34 @@ def test_other_same_sector_holdings_leave_only_ten_percent_room() -> None:
     assert decision.approved_target_weight == Decimal("0.10")
     assert decision.rule_ids == ("SECTOR_EXPOSURE_MAX_30",)
     assert len(decision.reasons) == 1
+
+
+def test_recurring_sector_ratio_is_conservatively_clamped_below_thirty_percent() -> None:
+    snapshot = portfolio((position("MSFT", "2"),), nav="11")
+    risk_context = context(
+        snapshot=snapshot,
+        instruments=(instrument("AAPL"), instrument("MSFT")),
+    )
+    with localcontext() as old_arithmetic:
+        old_arithmetic.prec = 128
+        old_arithmetic.rounding = ROUND_HALF_EVEN
+        old_room = Decimal("0.30") - (Decimal(2) / Decimal(11))
+    assert old_room <= 1
+    with localcontext() as exact_check:
+        exact_check.prec = 256
+        assert old_room * Decimal(11) + Decimal(2) > Decimal("0.30") * Decimal(11)
+
+    decision = RiskEngine().evaluate(buy_intent(target=str(old_room)), risk_context)
+
+    assert decision.status is RiskDecisionStatus.CLAMPED
+    assert decision.rule_ids == ("SECTOR_EXPOSURE_MAX_30",)
+    assert decision.approved_target_weight is not None
+    assert decision.approved_target_weight < old_room
+    with localcontext() as exact_check:
+        exact_check.prec = 256
+        assert decision.approved_target_weight * Decimal(11) + Decimal(2) <= (
+            Decimal("0.30") * Decimal(11)
+        )
 
 
 def test_missing_buy_metadata_rejects_with_sorted_symbols() -> None:
