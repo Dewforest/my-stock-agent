@@ -13,11 +13,12 @@ from pydantic import (
 )
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-PositiveDecimal = Annotated[Decimal, Field(gt=0)]
-NonNegativeDecimal = Annotated[Decimal, Field(ge=0)]
+Symbol = Annotated[
+    str, StringConstraints(strip_whitespace=True, to_upper=True, min_length=1)
+]
 StrictPositiveDecimal = Annotated[Decimal, Field(strict=True, gt=0)]
 StrictNonNegativeDecimal = Annotated[Decimal, Field(strict=True, ge=0)]
-UnitDecimal = Annotated[Decimal, Field(ge=0, le=1)]
+StrictUnitDecimal = Annotated[Decimal, Field(strict=True, ge=0, le=1)]
 PercentageInt = Annotated[int, Field(ge=0, le=100)]
 
 
@@ -44,7 +45,7 @@ class Side(StrEnum):
 
 class Instrument(_ImmutableModel):
 
-    symbol: NonEmptyStr
+    symbol: Symbol
     market: Market
     currency: Currency
     sector: NonEmptyStr
@@ -58,7 +59,7 @@ class Instrument(_ImmutableModel):
 
 
 class Bar(_ImmutableModel):
-    symbol: NonEmptyStr
+    symbol: Symbol
     market: Market
     session_date: date
     open: StrictPositiveDecimal
@@ -69,7 +70,9 @@ class Bar(_ImmutableModel):
     available_at: AwareDatetime
 
     @model_validator(mode="after")
-    def ohlc_is_consistent(self) -> Self:
+    def bar_is_consistent(self) -> Self:
+        if self.available_at.date() < self.session_date:
+            raise ValueError("available_at cannot be before session_date")
         if self.high < max(self.open, self.low, self.close):
             raise ValueError("high must be at least open, low, and close")
         if self.low > min(self.open, self.high, self.close):
@@ -78,23 +81,28 @@ class Bar(_ImmutableModel):
 
 
 class Position(_ImmutableModel):
-    symbol: NonEmptyStr
-    quantity: PositiveDecimal
-    average_cost: PositiveDecimal
-    market_value: NonNegativeDecimal
+    symbol: Symbol
+    quantity: StrictPositiveDecimal
+    average_cost: StrictPositiveDecimal
+    market_value: StrictNonNegativeDecimal
 
 
 class PortfolioSnapshot(_ImmutableModel):
     account_id: NonEmptyStr
     market: Market
-    cash: NonNegativeDecimal
-    nav: NonNegativeDecimal
-    peak_nav: NonNegativeDecimal
+    cash: StrictNonNegativeDecimal
+    nav: StrictNonNegativeDecimal
+    peak_nav: StrictNonNegativeDecimal
     positions: tuple[Position, ...] = ()
     as_of: AwareDatetime
 
     @model_validator(mode="after")
     def portfolio_is_consistent(self) -> Self:
+        positions_value = sum(
+            (position.market_value for position in self.positions), start=Decimal(0)
+        )
+        if self.nav != self.cash + positions_value:
+            raise ValueError("nav must equal cash plus total position market value")
         if self.peak_nav < self.nav:
             raise ValueError("peak_nav must be at least nav")
         symbols = [position.symbol for position in self.positions]
@@ -105,10 +113,10 @@ class PortfolioSnapshot(_ImmutableModel):
 
 class StrategyIntent(_ImmutableModel):
     strategy_id: NonEmptyStr
-    symbol: NonEmptyStr
+    symbol: Symbol
     market: Market
     side: Side
-    target_weight: UnitDecimal
+    target_weight: StrictUnitDecimal
     confidence: PercentageInt
     as_of: AwareDatetime
     thesis: NonEmptyStr

@@ -1,4 +1,5 @@
-from datetime import UTC, date, datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 
 import pytest
@@ -17,6 +18,11 @@ from stock_agent.domain.models import (
 )
 
 
+class NullOffsetTZ(tzinfo):
+    def utcoffset(self, dt: datetime | None) -> None:
+        return None
+
+
 def test_instrument_strips_text_fields() -> None:
     instrument = Instrument(
         symbol=" 600519 ",
@@ -27,6 +33,23 @@ def test_instrument_strips_text_fields() -> None:
 
     assert instrument.symbol == "600519"
     assert instrument.sector == "Consumer Staples"
+
+
+def test_instrument_canonicalizes_symbol() -> None:
+    us_instrument = Instrument(
+        symbol=" aapl ",
+        market=Market.US,
+        currency=Currency.USD,
+        sector="Technology",
+    )
+    cn_instrument = Instrument(
+        symbol=" 600519 ",
+        market=Market.CN,
+        currency=Currency.CNY,
+        sector="Consumer Staples",
+    )
+    assert us_instrument.symbol == "AAPL"
+    assert cn_instrument.symbol == "600519"
 
 
 @pytest.mark.parametrize("field", ["symbol", "sector"])
@@ -160,6 +183,15 @@ def test_strategy_intent_strips_text_and_freezes_evidence_ids() -> None:
         intent.confidence = 90
 
 
+def test_strategy_intent_canonicalizes_only_symbol() -> None:
+    intent = make_intent(
+        symbol=" aapl ", strategy_id=" momentum-v1 ", thesis=" lowercase thesis "
+    )
+    assert intent.symbol == "AAPL"
+    assert intent.strategy_id == "momentum-v1"
+    assert intent.thesis == "lowercase thesis"
+
+
 def make_bar(**overrides: object) -> Bar:
     values = {
         "symbol": "AAPL",
@@ -182,6 +214,10 @@ def test_bar_preserves_decimal_values() -> None:
     assert isinstance(bar.volume, Decimal)
 
 
+def test_bar_canonicalizes_symbol() -> None:
+    assert make_bar(symbol=" aapl ").symbol == "AAPL"
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -200,6 +236,24 @@ def test_bar_rejects_float_values(field: str, value: float) -> None:
 def test_bar_rejects_naive_available_at() -> None:
     with pytest.raises(ValidationError):
         make_bar(available_at=datetime(2026, 7, 27, 21))
+
+
+def test_bar_rejects_available_at_before_session_date() -> None:
+    with pytest.raises(ValidationError):
+        make_bar(available_at=datetime(2026, 7, 26, 21, tzinfo=UTC))
+
+
+@pytest.mark.parametrize(
+    "available_at",
+    [
+        datetime(2026, 7, 27, 0, tzinfo=UTC),
+        datetime(2026, 7, 28, 0, tzinfo=UTC),
+    ],
+)
+def test_bar_accepts_available_at_on_or_after_session_date(
+    available_at: datetime,
+) -> None:
+    assert make_bar(available_at=available_at).available_at == available_at
 
 
 @pytest.mark.parametrize("field", ["open", "high", "low", "close"])
@@ -259,17 +313,86 @@ def test_position_strips_symbol_and_accepts_zero_market_value() -> None:
     assert position.market_value == Decimal("0")
 
 
+def test_position_canonicalizes_symbol() -> None:
+    assert make_position(symbol=" aapl ").symbol == "AAPL"
+
+
 def make_snapshot(**overrides: object) -> PortfolioSnapshot:
     values = {
         "account_id": "brokerage-1",
         "market": Market.US,
         "cash": Decimal("1000"),
-        "nav": Decimal("10000"),
         "peak_nav": Decimal("12000"),
         "as_of": datetime(2026, 7, 27, 21, tzinfo=UTC),
     }
     values.update(overrides)
+    if "nav" not in overrides:
+        positions = values.get("positions", ())
+        cash = values["cash"]
+        values["nav"] = (
+            cash + sum(position.market_value for position in positions)
+            if isinstance(cash, Decimal)
+            else Decimal("1000")
+        )
     return PortfolioSnapshot(**values)
+
+
+@pytest.mark.parametrize(
+    ("factory", "field", "decimal_value"),
+    [
+        (make_intent, "target_weight", Decimal("1")),
+        (make_position, "quantity", Decimal("10")),
+        (make_position, "average_cost", Decimal("100")),
+        (make_position, "market_value", Decimal("1050")),
+        (make_snapshot, "cash", Decimal("1000")),
+        (make_snapshot, "nav", Decimal("10000")),
+        (make_snapshot, "peak_nav", Decimal("12000")),
+    ],
+)
+@pytest.mark.parametrize("input_type", [float, str, int])
+def test_financial_decimal_fields_reject_non_decimal_inputs(
+    factory: Callable[..., object],
+    field: str,
+    decimal_value: Decimal,
+    input_type: Callable[[Decimal], object],
+) -> None:
+    with pytest.raises(ValidationError):
+        factory(**{field: input_type(decimal_value)})
+
+
+@pytest.mark.parametrize(
+    ("factory", "field"),
+    [
+        (make_bar, "open"),
+        (make_intent, "target_weight"),
+        (make_position, "quantity"),
+        (make_snapshot, "cash"),
+    ],
+)
+@pytest.mark.parametrize(
+    "value", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")]
+)
+def test_representative_financial_fields_reject_non_finite_decimals(
+    factory: Callable[..., object], field: str, value: Decimal
+) -> None:
+    with pytest.raises(ValidationError):
+        factory(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("factory", "field"),
+    [
+        (make_bar, "available_at"),
+        (make_intent, "as_of"),
+        (make_snapshot, "as_of"),
+    ],
+)
+def test_aware_datetimes_reject_tzinfo_with_none_offset(
+    factory: Callable[..., object], field: str
+) -> None:
+    invalid_datetime = datetime(2026, 7, 27, 12, tzinfo=NullOffsetTZ())
+    with pytest.raises(ValidationError):
+        factory(**{field: invalid_datetime})
 
 
 @pytest.mark.parametrize("field", ["cash", "nav", "peak_nav"])
@@ -280,11 +403,42 @@ def test_portfolio_snapshot_rejects_negative_amounts(field: str) -> None:
 
 def test_portfolio_snapshot_rejects_peak_below_nav() -> None:
     with pytest.raises(ValidationError):
-        make_snapshot(nav=Decimal("100"), peak_nav=Decimal("99.99"))
+        make_snapshot(
+            cash=Decimal("100"), nav=Decimal("100"), peak_nav=Decimal("99.99")
+        )
+
+
+def test_portfolio_snapshot_rejects_nav_inconsistent_with_cash_and_positions() -> None:
+    with pytest.raises(ValidationError):
+        make_snapshot(nav=Decimal("1001"))
+
+
+def test_portfolio_snapshot_accepts_accounting_identity_with_empty_positions() -> None:
+    snapshot = make_snapshot(cash=Decimal("1000"), nav=Decimal("1000"))
+    assert snapshot.nav == snapshot.cash
+
+
+def test_portfolio_snapshot_accepts_accounting_identity_with_multiple_positions() -> None:
+    positions = [
+        make_position(symbol="AAPL", market_value=Decimal("1050")),
+        make_position(symbol="MSFT", market_value=Decimal("950")),
+    ]
+    snapshot = make_snapshot(
+        cash=Decimal("1000"), nav=Decimal("3000"), positions=positions
+    )
+    assert snapshot.nav == snapshot.cash + sum(
+        position.market_value for position in snapshot.positions
+    )
 
 
 def test_portfolio_snapshot_rejects_duplicate_position_symbols() -> None:
     positions = [make_position(symbol="AAPL"), make_position(symbol="AAPL")]
+    with pytest.raises(ValidationError):
+        make_snapshot(positions=positions)
+
+
+def test_portfolio_snapshot_rejects_position_symbols_duplicate_after_canonicalization() -> None:
+    positions = [make_position(symbol="aapl"), make_position(symbol=" AAPL ")]
     with pytest.raises(ValidationError):
         make_snapshot(positions=positions)
 
