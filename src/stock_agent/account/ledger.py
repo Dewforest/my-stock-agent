@@ -1,5 +1,15 @@
 from datetime import date
-from decimal import Decimal
+from decimal import (
+    ROUND_HALF_EVEN,
+    Context,
+    Decimal,
+    DecimalException,
+    DivisionByZero,
+    InvalidOperation,
+    Overflow,
+    Underflow,
+    localcontext,
+)
 from typing import Annotated, Self
 
 from pydantic import (
@@ -13,7 +23,7 @@ from pydantic import (
     model_validator,
 )
 
-from stock_agent.domain import Market
+from stock_agent.domain import Market, PortfolioSnapshot, Position
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Symbol = Annotated[
@@ -126,3 +136,236 @@ class EventReversed(_LedgerEvent):
 LedgerEvent = (
     CashInitialized | BuyFilled | SellFilled | CashAdjusted | PositionMarked | EventReversed
 )
+
+_ARITHMETIC_CONTEXT = Context(
+    prec=128,
+    rounding=ROUND_HALF_EVEN,
+    Emin=-999999,
+    Emax=999999,
+    capitals=1,
+    clamp=0,
+    flags=[],
+    traps=[InvalidOperation, DivisionByZero, Overflow, Underflow],
+)
+
+
+class _Holding:
+    def __init__(self, quantity: Decimal, cost_basis: Decimal, mark_price: Decimal) -> None:
+        self.quantity = quantity
+        self.cost_basis = cost_basis
+        self.mark_price = mark_price
+
+
+class PortfolioLedger:
+    def __init__(self, account_id: str, market: Market) -> None:
+        if not isinstance(account_id, str):
+            raise TypeError("account_id must be a string")
+        account_id = account_id.strip()
+        if not account_id:
+            raise ValueError("account_id must not be blank")
+        if not isinstance(market, Market):
+            raise TypeError("market must be a Market")
+
+        self._account_id = account_id
+        self._market = market
+        self._events: tuple[LedgerEvent, ...] = ()
+        self._cash: Decimal | None = None
+        self._realized_pnl: Decimal | None = None
+        self._positions: tuple[Position, ...] | None = None
+        self._snapshot: PortfolioSnapshot | None = None
+
+    @property
+    def account_id(self) -> str:
+        return self._account_id
+
+    @property
+    def market(self) -> Market:
+        return self._market
+
+    @property
+    def events(self) -> tuple[LedgerEvent, ...]:
+        return self._events
+
+    @property
+    def cash(self) -> Decimal:
+        if self._cash is None:
+            raise RuntimeError("cash has not been initialized")
+        return self._cash
+
+    @property
+    def realized_pnl(self) -> Decimal:
+        if self._realized_pnl is None:
+            raise RuntimeError("cash has not been initialized")
+        return self._realized_pnl
+
+    @property
+    def positions(self) -> tuple[Position, ...]:
+        if self._positions is None:
+            raise RuntimeError("cash has not been initialized")
+        return self._positions
+
+    def snapshot(self) -> PortfolioSnapshot:
+        if self._snapshot is None:
+            raise RuntimeError("cash has not been initialized")
+        return self._snapshot
+
+    def append(self, event: LedgerEvent) -> None:
+        if not isinstance(
+            event,
+            (CashInitialized, BuyFilled, SellFilled, CashAdjusted, PositionMarked, EventReversed),
+        ):
+            raise TypeError("event must be a LedgerEvent")
+        if event.account_id != self._account_id or event.market is not self._market:
+            raise ValueError("event account and market must match the ledger")
+        if isinstance(event, EventReversed):
+            raise ValueError("reversal support not yet; applied separately in B2")
+        if not self._events and not isinstance(event, CashInitialized):
+            raise ValueError("the first event must be CashInitialized")
+        if any(existing.event_id == event.event_id for existing in self._events):
+            raise ValueError("event_id must be unique")
+        if self._events and event.occurred_at <= self._events[-1].occurred_at:
+            raise ValueError("occurred_at must be strictly increasing")
+        if isinstance(event, CashInitialized) and self._events:
+            raise ValueError("CashInitialized can only occur once")
+
+        candidate = (*self._events, event)
+        try:
+            cash, realized_pnl, positions, snapshot = self._replay(candidate)
+        except DecimalException as error:
+            raise ValueError("decimal arithmetic failed") from error
+
+        self._events = candidate
+        self._cash = cash
+        self._realized_pnl = realized_pnl
+        self._positions = positions
+        self._snapshot = snapshot
+
+    def _replay(
+        self, events: tuple[LedgerEvent, ...]
+    ) -> tuple[Decimal, Decimal, tuple[Position, ...], PortfolioSnapshot]:
+        context = _ARITHMETIC_CONTEXT.copy()
+        cash: Decimal | None = None
+        realized_pnl = Decimal(0)
+        peak_nav: Decimal | None = None
+        holdings: dict[str, _Holding] = {}
+        positions: tuple[Position, ...] = ()
+        snapshot: PortfolioSnapshot | None = None
+
+        for replayed in events:
+            if isinstance(replayed, CashInitialized):
+                cash = replayed.amount
+                peak_nav = replayed.amount
+            elif isinstance(replayed, BuyFilled):
+                assert cash is not None
+                cost = context.add(
+                    context.multiply(replayed.quantity, replayed.price), replayed.fees
+                )
+                new_cash = context.subtract(cash, cost)
+                self._require_finite(cost, new_cash)
+                if cost > cash or new_cash < 0:
+                    raise ValueError("insufficient cash")
+                holding = holdings.get(replayed.symbol)
+                if holding is None:
+                    holdings[replayed.symbol] = _Holding(
+                        replayed.quantity, cost, replayed.price
+                    )
+                else:
+                    holding.quantity = context.add(holding.quantity, replayed.quantity)
+                    holding.cost_basis = context.add(holding.cost_basis, cost)
+                    holding.mark_price = replayed.price
+                    self._require_finite(holding.quantity, holding.cost_basis)
+                cash = new_cash
+            elif isinstance(replayed, SellFilled):
+                assert cash is not None
+                holding = holdings.get(replayed.symbol)
+                if holding is None or replayed.quantity > holding.quantity:
+                    raise ValueError("cannot sell more than the held quantity")
+                proceeds = context.subtract(
+                    context.multiply(replayed.quantity, replayed.price), replayed.fees
+                )
+                self._require_finite(proceeds)
+                if proceeds < 0:
+                    raise ValueError("sell proceeds cannot be negative")
+                if replayed.quantity == holding.quantity:
+                    allocated_cost = holding.cost_basis
+                else:
+                    allocated_cost = context.divide(
+                        context.multiply(holding.cost_basis, replayed.quantity),
+                        holding.quantity,
+                    )
+                cash = context.add(cash, proceeds)
+                realized_pnl = context.add(
+                    realized_pnl, context.subtract(proceeds, allocated_cost)
+                )
+                remaining_quantity = context.subtract(holding.quantity, replayed.quantity)
+                remaining_cost = context.subtract(holding.cost_basis, allocated_cost)
+                self._require_finite(
+                    allocated_cost, cash, realized_pnl, remaining_quantity, remaining_cost
+                )
+                if remaining_quantity == 0:
+                    del holdings[replayed.symbol]
+                else:
+                    holding.quantity = remaining_quantity
+                    holding.cost_basis = remaining_cost
+                    holding.mark_price = replayed.price
+            elif isinstance(replayed, CashAdjusted):
+                assert cash is not None
+                new_cash = context.add(cash, replayed.amount)
+                self._require_finite(new_cash)
+                if new_cash < 0:
+                    raise ValueError("cash adjustment cannot make cash negative")
+                cash = new_cash
+            elif isinstance(replayed, PositionMarked):
+                holding = holdings.get(replayed.symbol)
+                if holding is None:
+                    raise ValueError("cannot mark an unknown position")
+                holding.mark_price = replayed.price
+            else:
+                raise ValueError("event replay is not implemented")
+
+            positions = self._public_positions(holdings, context)
+            market_value = Decimal(0)
+            for position in positions:
+                market_value = context.add(market_value, position.market_value)
+            nav = context.add(cash, market_value)
+            self._require_finite(cash, realized_pnl, market_value, nav)
+            assert peak_nav is not None
+            peak_nav = max(peak_nav, nav)
+            with localcontext(context):
+                snapshot = PortfolioSnapshot(
+                    account_id=self._account_id,
+                    market=self._market,
+                    cash=cash,
+                    nav=nav,
+                    peak_nav=peak_nav,
+                    positions=positions,
+                    as_of=replayed.occurred_at,
+                )
+
+        assert cash is not None and snapshot is not None
+        return cash, realized_pnl, positions, snapshot
+
+    @staticmethod
+    def _require_finite(*values: Decimal) -> None:
+        if not all(value.is_finite() for value in values):
+            raise ValueError("decimal arithmetic must remain finite")
+
+    @staticmethod
+    def _public_positions(
+        holdings: dict[str, _Holding], context: Context
+    ) -> tuple[Position, ...]:
+        result = []
+        for symbol in sorted(holdings):
+            holding = holdings[symbol]
+            average_cost = context.divide(holding.cost_basis, holding.quantity)
+            market_value = context.multiply(holding.quantity, holding.mark_price)
+            PortfolioLedger._require_finite(average_cost, market_value)
+            result.append(
+                Position(
+                    symbol=symbol,
+                    quantity=holding.quantity,
+                    average_cost=average_cost,
+                    market_value=market_value,
+                )
+            )
+        return tuple(result)

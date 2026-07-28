@@ -4,6 +4,7 @@ from stock_agent.account.ledger import (
     CashInitialized,
     EventReversed,
     LedgerEvent,
+    PortfolioLedger,
     PositionMarked,
     SellFilled,
 )
@@ -16,4 +17,5 @@ __all__ = [  # noqa: RUF022 - public contract order is intentional
     "PositionMarked",
     "EventReversed",
     "LedgerEvent",
+    "PortfolioLedger",
 ]
