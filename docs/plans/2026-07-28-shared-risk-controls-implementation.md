@@ -357,7 +357,41 @@ git commit -m "feat: enforce daily new-position budget"
 
 ---
 
-### Task 5: Final Task 8 verification and review
+### Task 5: Add atomic pending-BUY projection
+
+**Objective:** Prevent several intents evaluated before execution from jointly
+exceeding holding-count, sector, or daily-opening limits.
+
+**Files:**
+- Modify: `src/stock_agent/risk/engine.py`
+- Create: `tests/risk/test_batch_evaluation.py`
+
+Implement strict `RiskEngine.evaluate_many(intents, context)` with an
+invocation-local projection. Require an exact tuple, exact `StrategyIntent` values,
+and unique symbols. Process in input priority order. Only successful BUY decisions
+reserve projected target weight, a holding slot, and (for symbols absent from the
+starting snapshot) approved target notional. Never release capacity for pending
+SELL/HOLD/REDUCE decisions. Make `evaluate` the one-item path over the same core
+logic.
+
+TDD scenarios:
+
+- an empty batch returns an empty tuple;
+- mutable/list/subclass input and duplicate symbols are rejected;
+- from nine holdings, the first new symbol is approved and the second is rejected;
+- 20% existing sector exposure plus two 5% BUYs reaches 30%, and a third BUY is
+  rejected;
+- daily opening commitments accumulate approved, not submitted, target notionals;
+- rejected and non-BUY decisions do not reserve or release capacity;
+- repeated and hostile-context runs are byte-identical and do not mutate inputs;
+- sequential standalone `evaluate` calls remain isolated by design.
+
+Verify focused, risk, full, Ruff, and diff checks, then commit:
+`feat: evaluate risk intents atomically`.
+
+---
+
+### Task 6: Final Task 8 verification and review
 
 **Objective:** Prove the complete public risk contract against the approved design and existing system.
 

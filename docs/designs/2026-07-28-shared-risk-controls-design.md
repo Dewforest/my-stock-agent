@@ -177,6 +177,31 @@ daily_target_cap = remaining_budget / portfolio.nav
 
 The denominator is day-start available cash, not a shrinking current-cash value. This keeps sequential decisions deterministic. Existing-position increases do not count as new-position commitments in Phase 1.
 
+## 4.5 Atomic Batch Evaluation
+
+`RiskEngine.evaluate_many(intents, context)` is the authoritative interface when a
+session produces more than one intent before orders execute. It evaluates an exact
+tuple of unique-symbol intents in caller-supplied priority order and returns an
+aligned tuple of decisions.
+
+The method keeps a private, invocation-local projection of approved BUY targets:
+
+- approved new symbols reserve a holding slot;
+- approved targets replace that symbol's projected portfolio weight for later
+  sector checks;
+- approved new-symbol target notionals consume the remaining daily opening budget;
+- rejected intents and non-BUY intents do not release or reserve projected capacity.
+
+This is deliberately conservative: an unexecuted SELL or REDUCE cannot finance or
+make room for a later BUY because the future exit may fail. Duplicate symbols are
+invalid batch input rather than two orders against one target. The supplied order is
+the explicit strategy-priority order and therefore part of deterministic replay.
+
+`evaluate(intent, context)` remains the single-intent convenience API and is
+equivalent to evaluating a one-item batch. The engine stores no projection between
+calls. Task 10 must gather one market/session's intents and call `evaluate_many`
+once; repeated separate `evaluate` calls intentionally do not share reservations.
+
 ## 5. Rule IDs
 
 The implementation exposes stable string rule IDs:
