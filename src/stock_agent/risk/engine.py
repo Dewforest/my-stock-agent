@@ -112,6 +112,49 @@ def _compare_scaled_decimals(
     return (left_integer > right_integer) - (left_integer < right_integer)
 
 
+def _compare_decimal_products(a: Decimal, b: Decimal, c: Decimal, d: Decimal) -> int:
+    values = (a, b, c, d)
+    if any(value < 0 for value in values):
+        raise ValueError("product comparison values must be nonnegative")
+
+    tuples = tuple(value.as_tuple() for value in values)
+    if any(not isinstance(value_tuple.exponent, int) for value_tuple in tuples):
+        raise ValueError("product comparison values must be finite")
+
+    coefficients = tuple(
+        int("".join(map(str, value_tuple.digits))) for value_tuple in tuples
+    )
+    left_coefficient = coefficients[0] * coefficients[1]
+    right_coefficient = coefficients[2] * coefficients[3]
+    if left_coefficient == 0 or right_coefficient == 0:
+        return (left_coefficient > right_coefficient) - (
+            left_coefficient < right_coefficient
+        )
+
+    a_exponent, b_exponent, c_exponent, d_exponent = (
+        value_tuple.exponent for value_tuple in tuples
+    )
+    assert isinstance(a_exponent, int)
+    assert isinstance(b_exponent, int)
+    assert isinstance(c_exponent, int)
+    assert isinstance(d_exponent, int)
+    left_exponent = a_exponent + b_exponent
+    right_exponent = c_exponent + d_exponent
+    left_digits = str(left_coefficient)
+    right_digits = str(right_coefficient)
+    left_adjusted = left_exponent + len(left_digits) - 1
+    right_adjusted = right_exponent + len(right_digits) - 1
+    if left_adjusted != right_adjusted:
+        return (left_adjusted > right_adjusted) - (left_adjusted < right_adjusted)
+
+    width = max(len(left_digits), len(right_digits))
+    left_significand = left_digits.ljust(width, "0")
+    right_significand = right_digits.ljust(width, "0")
+    return (left_significand > right_significand) - (
+        left_significand < right_significand
+    )
+
+
 def _drawdown_thresholds(peak_nav: Decimal, nav: Decimal) -> tuple[bool, bool]:
     if peak_nav == 0:
         return False, False
@@ -145,7 +188,10 @@ def _ratio_rounded_down(numerator: Decimal, denominator: Decimal) -> Decimal:
     numerator_tuple = numerator.as_tuple()
     denominator_tuple = denominator.as_tuple()
     arithmetic = Context(
-        prec=max(128, len(numerator_tuple.digits) + len(denominator_tuple.digits) + 32),
+        prec=min(
+            MAX_PREC,
+            max(128, len(numerator_tuple.digits) + len(denominator_tuple.digits) + 32),
+        ),
         rounding=ROUND_FLOOR,
         Emin=MIN_EMIN,
         Emax=MAX_EMAX,
@@ -381,9 +427,14 @@ def _evaluate_buy_exposure(intent: StrategyIntent, context: RiskContext) -> Risk
                 daily_budget, context.new_position_notional_committed_today
             ),
         )
-        daily_target_cap = _ratio_rounded_down(remaining, portfolio.nav)
-        if daily_target_cap < approved_target:
-            approved_target = daily_target_cap
+        budget_is_binding = (
+            _compare_decimal_products(
+                remaining, Decimal(1), approved_target, portfolio.nav
+            )
+            < 0
+        )
+        if budget_is_binding:
+            approved_target = _ratio_rounded_down(remaining, portfolio.nav)
             rule_ids.append(_DAILY_NEW_POSITION_CASH_MAX_30)
             reasons.append(
                 "buy target exceeds remaining daily new-position cash budget of thirty percent"

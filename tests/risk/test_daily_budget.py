@@ -20,7 +20,6 @@ from stock_agent.domain import (
     StrategyIntent,
 )
 from stock_agent.risk import RiskContext, RiskDecisionStatus, RiskEngine
-from stock_agent.risk.engine import _ratio_rounded_down
 
 AS_OF = datetime(2026, 7, 28, 12, tzinfo=UTC)
 DAILY_RULE = "DAILY_NEW_POSITION_CASH_MAX_30"
@@ -241,12 +240,22 @@ def test_recurring_daily_ratio_is_rounded_down_conservatively() -> None:
         assert decision.approved_target_weight * Decimal(11) <= Decimal(1)
 
 
-def test_ratio_helper_rounds_two_elevenths_down() -> None:
-    ratio = _ratio_rounded_down(Decimal(2), Decimal(11))
+def test_cross_magnitude_nonbinding_daily_budget_is_approved() -> None:
+    with localcontext() as construction:
+        construction.Emax = MAX_EMAX
+        day_start_cash = f"9E+{MAX_EMAX}"
+        risk_context = context(
+            day_start_cash=day_start_cash,
+            committed="0",
+            nav=".01",
+            cash=".01",
+        )
 
-    with localcontext() as exact_check:
-        exact_check.prec = 256
-        assert ratio * Decimal(11) <= Decimal(2)
+    decision = RiskEngine().evaluate(intent(), risk_context)
+
+    assert decision.status is RiskDecisionStatus.APPROVED
+    assert decision.approved_target_weight == Decimal("0.15")
+    assert decision.rule_ids == ()
 
 
 def test_exact_daily_ratio_is_not_mistakenly_clamped() -> None:
