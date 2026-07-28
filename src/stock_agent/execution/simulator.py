@@ -1,11 +1,15 @@
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import Context, Decimal, DecimalException, localcontext
 
 from stock_agent.domain import Bar, Market, Side
 from stock_agent.execution.models import Fill, FillStatus, OrderIntent
 from stock_agent.market import NoFutureSession, TradingCalendar
+
+_MAX_SUPPORTED_DECIMAL = Decimal("1E26")
+_MAX_DECIMAL_PLACES = 12
+_UNSUPPORTED_NUMERIC_REASON = "unsupported numeric range/precision"
 
 
 @dataclass(frozen=True)
@@ -40,9 +44,14 @@ class ExecutionSimulator:
                     raise TypeError("transaction costs must be Decimal values")
                 if not cost.is_finite() or cost < 0:
                     raise ValueError("transaction costs must be finite and nonnegative")
+                if not self._is_supported_decimal(cost):
+                    raise ValueError(
+                        f"transaction costs have {_UNSUPPORTED_NUMERIC_REASON}"
+                    )
             self._costs.update(copied_costs)
         self._pending: list[_PendingOrder] = []
         self._used_order_ids: set[str] = set()
+        self._processed_through: dict[Market, date] = {}
 
     @property
     def pending_order_ids(self) -> tuple[str, ...]:
@@ -55,6 +64,21 @@ class ExecutionSimulator:
                 intent, FillStatus.REJECTED, reason="duplicate order_id"
             )
         self._used_order_ids.add(intent.order_id)
+
+        if not self._is_supported_decimal(intent.quantity):
+            return self._make_fill(
+                intent,
+                FillStatus.REJECTED,
+                reason=f"quantity has {_UNSUPPORTED_NUMERIC_REASON}",
+            )
+
+        processed_through = self._processed_through.get(intent.market)
+        if processed_through is not None and decision_date < processed_through:
+            return self._make_fill(
+                intent,
+                FillStatus.REJECTED,
+                reason="decision_date is backdated before processed timeline",
+            )
 
         if intent.side not in (Side.BUY, Side.SELL):
             return self._make_fill(
@@ -106,36 +130,88 @@ class ExecutionSimulator:
                 raise ValueError(f"duplicate bar symbol {bar.symbol}")
             bars_by_symbol[bar.symbol] = bar
 
+        processed_through = self._processed_through.get(market)
+        if processed_through is not None and session_date < processed_through:
+            raise ValueError(
+                f"cannot process {market.value} timeline backward from "
+                f"{processed_through} to {session_date}"
+            )
+
         fills: list[Fill] = []
         remaining: list[_PendingOrder] = []
         for pending in self._pending:
             intent = pending.intent
             bar = bars_by_symbol.get(intent.symbol)
-            if (
-                intent.market is market
-                and session_date >= pending.eligible_session
-                and bar is not None
-            ):
-                fees = intent.quantity * bar.open * self._costs[market] / Decimal("10000")
+            is_eligible = (
+                intent.market is market and session_date >= pending.eligible_session
+            )
+            if not is_eligible or bar is None:
+                remaining.append(pending)
+                continue
+
+            if not self._is_supported_decimal(bar.open):
                 fills.append(
                     self._make_fill(
                         intent,
-                        FillStatus.FILLED,
-                        filled_quantity=intent.quantity,
-                        price=bar.open,
-                        fees=fees,
-                        session_date=session_date,
+                        FillStatus.REJECTED,
+                        reason=f"bar open has {_UNSUPPORTED_NUMERIC_REASON}",
                     )
                 )
-            else:
-                remaining.append(pending)
+                continue
+
+            try:
+                fees = self._calculate_fees(
+                    intent.quantity, bar.open, self._costs[market]
+                )
+            except DecimalException:
+                fills.append(
+                    self._make_fill(
+                        intent,
+                        FillStatus.REJECTED,
+                        reason="fee calculation failed for unsupported numeric result",
+                    )
+                )
+                continue
+
+            fills.append(
+                self._make_fill(
+                    intent,
+                    FillStatus.FILLED,
+                    filled_quantity=intent.quantity,
+                    price=bar.open,
+                    fees=fees,
+                    session_date=session_date,
+                )
+            )
         self._pending = remaining
+        if processed_through is None or session_date > processed_through:
+            self._processed_through[market] = session_date
         return tuple(fills)
 
     @staticmethod
     def _require_plain_date(value: object, name: str) -> None:
         if type(value) is not date:
             raise TypeError(f"{name} must be a plain date")
+
+    @staticmethod
+    def _is_supported_decimal(value: Decimal) -> bool:
+        if not value.is_finite() or value.copy_abs() >= _MAX_SUPPORTED_DECIMAL:
+            return False
+        decimal_tuple = value.as_tuple()
+        exponent = decimal_tuple.exponent
+        if not isinstance(exponent, int) or exponent >= -_MAX_DECIMAL_PLACES:
+            return True
+        excess_places = -_MAX_DECIMAL_PLACES - exponent
+        return all(digit == 0 for digit in decimal_tuple.digits[-excess_places:])
+
+    @staticmethod
+    def _calculate_fees(quantity: Decimal, price: Decimal, bps: Decimal) -> Decimal:
+        coefficient_digits = sum(
+            len(value.as_tuple().digits) for value in (quantity, price, bps)
+        )
+        context = Context(prec=max(128, coefficient_digits + 16))
+        with localcontext(context):
+            return quantity * price * bps / Decimal("10000")
 
     @staticmethod
     def _make_fill(

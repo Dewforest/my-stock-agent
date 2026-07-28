@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, localcontext
 
 import pytest
 from pydantic import ValidationError
@@ -138,6 +138,113 @@ def test_sell_fills_with_overridden_decimal_transaction_cost() -> None:
     assert fill.fees == Decimal("3") * Decimal("101") * Decimal("7.5") / Decimal("10000")
 
 
+def test_fees_are_exact_and_independent_of_ambient_decimal_precision() -> None:
+    quantity = Decimal("99999999999999999999999999.999999999999")
+    open_price = Decimal("99999999999999999999999999.999999999998")
+    bps = Decimal("99999999999999999999999999.999999999997")
+    fees = []
+
+    for precision in (10, 28, 50):
+        with localcontext() as context:
+            context.prec = precision
+            simulator = ExecutionSimulator(
+                {Market.US: make_calendar()},
+                transaction_cost_bps={Market.US: bps},
+            )
+            simulator.submit(make_intent(quantity=quantity), date(2026, 7, 24))
+            fill = simulator.process_session(
+                market=Market.US,
+                session_date=date(2026, 7, 27),
+                bars=[
+                    make_bar(
+                        open=open_price,
+                        high=open_price,
+                        low=open_price,
+                        close=open_price,
+                    )
+                ],
+            )[0]
+            fees.append(fill.fees)
+
+    with localcontext() as context:
+        context.prec = 128
+        expected = quantity * open_price * bps / Decimal("10000")
+    assert fees == [expected, expected, expected]
+
+
+def test_decimal_calculation_exception_becomes_rejected_fill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    simulator = ExecutionSimulator({Market.US: make_calendar()})
+    simulator.submit(make_intent(), date(2026, 7, 24))
+
+    def fail_calculation(*_values: Decimal) -> Decimal:
+        raise InvalidOperation
+
+    monkeypatch.setattr(simulator, "_calculate_fees", fail_calculation)
+    fill = simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 27),
+        bars=[make_bar()],
+    )[0]
+
+    assert_rejected(fill, "calculation")
+    assert simulator.pending_order_ids == ()
+
+
+@pytest.mark.parametrize(
+    "quantity",
+    [Decimal("1.0000000000001"), Decimal("1E26")],
+)
+def test_unsupported_quantity_is_rejected_without_pending_pollution(
+    quantity: Decimal,
+) -> None:
+    simulator = ExecutionSimulator({Market.US: make_calendar()})
+
+    rejected = simulator.submit(make_intent(quantity=quantity), date(2026, 7, 24))
+
+    assert_rejected(rejected, "unsupported numeric range/precision")
+    assert simulator.pending_order_ids == ()
+
+
+@pytest.mark.parametrize(
+    "bps",
+    [Decimal("1.0000000000001"), Decimal("1E26")],
+)
+def test_unsupported_transaction_cost_is_rejected_by_constructor(bps: Decimal) -> None:
+    with pytest.raises(ValueError, match="unsupported numeric range/precision"):
+        ExecutionSimulator(
+            {Market.US: make_calendar()},
+            transaction_cost_bps={Market.US: bps},
+        )
+
+
+@pytest.mark.parametrize(
+    "open_price",
+    [Decimal("100.0000000000001"), Decimal("1E26")],
+)
+def test_unsupported_bar_open_rejects_eligible_order_and_removes_it(
+    open_price: Decimal,
+) -> None:
+    simulator = ExecutionSimulator({Market.US: make_calendar()})
+    simulator.submit(make_intent(), date(2026, 7, 24))
+
+    fill = simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 27),
+        bars=[
+            make_bar(
+                open=open_price,
+                high=max(open_price, Decimal("110")),
+                close=max(open_price, Decimal("105")),
+            )
+        ],
+    )[0]
+
+    assert_rejected(fill, "unsupported numeric range/precision")
+    assert simulator.pending_order_ids == ()
+
+
 def test_missing_eligible_bar_stays_pending_and_fills_on_later_session() -> None:
     simulator = ExecutionSimulator({Market.US: make_calendar()})
     simulator.submit(make_intent(), date(2026, 7, 24))
@@ -163,6 +270,115 @@ def test_missing_eligible_bar_stays_pending_and_fills_on_later_session() -> None
     assert [fill.order_id for fill in fills] == ["order-1"]
     assert fills[0].session_date == date(2026, 7, 28)
     assert simulator.pending_order_ids == ()
+
+
+def test_process_rejects_market_time_travel_without_filling_pending_order() -> None:
+    simulator = ExecutionSimulator({Market.US: make_calendar()})
+    simulator.submit(make_intent(), date(2026, 7, 24))
+    assert simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 28),
+        bars=[],
+    ) == ()
+
+    with pytest.raises(ValueError, match=r"timeline|backward|processed"):
+        simulator.process_session(
+            market=Market.US,
+            session_date=date(2026, 7, 27),
+            bars=[make_bar()],
+        )
+
+    assert simulator.pending_order_ids == ("order-1",)
+
+
+def test_backdated_submit_is_rejected_and_reserves_order_id() -> None:
+    simulator = ExecutionSimulator({Market.US: make_calendar()})
+    simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 28),
+        bars=[],
+    )
+
+    rejected = simulator.submit(make_intent(), date(2026, 7, 24))
+    duplicate = simulator.submit(make_intent(symbol="MSFT"), date(2026, 7, 28))
+
+    assert_rejected(rejected, "timeline")
+    assert_rejected(duplicate, "duplicate")
+    assert simulator.pending_order_ids == ()
+
+
+def test_submit_on_processed_session_is_allowed_for_close_decision() -> None:
+    sessions = (*US_SESSIONS, date(2026, 7, 29))
+    simulator = ExecutionSimulator({Market.US: make_calendar(sessions=sessions)})
+    simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 27),
+        bars=[],
+    )
+
+    pending = simulator.submit(make_intent(), date(2026, 7, 27))
+    assert pending.status is FillStatus.PENDING
+    assert simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 27),
+        bars=[make_bar()],
+    ) == ()
+    fill = simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 28),
+        bars=[
+            make_bar(
+                session_date=date(2026, 7, 28),
+                available_at=datetime(2026, 7, 28, 21, tzinfo=UTC),
+            )
+        ],
+    )[0]
+    assert fill.session_date == date(2026, 7, 28)
+
+
+def test_reprocessing_same_session_can_fill_bar_that_arrived_late() -> None:
+    simulator = ExecutionSimulator({Market.US: make_calendar()})
+    simulator.submit(make_intent(), date(2026, 7, 24))
+
+    assert simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 27),
+        bars=[],
+    ) == ()
+    fills = simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 27),
+        bars=[make_bar()],
+    )
+
+    assert [fill.order_id for fill in fills] == ["order-1"]
+    assert simulator.pending_order_ids == ()
+
+
+def test_processed_watermarks_are_independent_per_market() -> None:
+    cn_sessions = (date(2026, 7, 24), date(2026, 7, 27), date(2026, 7, 28))
+    simulator = ExecutionSimulator(
+        {
+            Market.US: make_calendar(),
+            Market.CN: make_calendar(Market.CN, cn_sessions),
+        }
+    )
+    simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 28),
+        bars=[],
+    )
+
+    cn_pending = simulator.submit(
+        make_intent(order_id="cn", symbol="600519", market=Market.CN),
+        date(2026, 7, 24),
+    )
+    assert cn_pending.status is FillStatus.PENDING
+    assert simulator.process_session(
+        market=Market.CN,
+        session_date=date(2026, 7, 27),
+        bars=[],
+    ) == ()
 
 
 def test_processing_is_market_isolated_ordered_and_idempotent() -> None:
@@ -308,6 +524,23 @@ def test_invalid_bars_are_rejected_atomically(bars: list[Bar]) -> None:
         bars=[make_bar(), make_bar(symbol="MSFT")],
     )
     assert [fill.order_id for fill in fills] == ["first", "second"]
+
+
+def test_invalid_bars_do_not_advance_processed_watermark() -> None:
+    simulator = ExecutionSimulator({Market.US: make_calendar()})
+
+    with pytest.raises(ValueError, match="session_date"):
+        simulator.process_session(
+            market=Market.US,
+            session_date=date(2026, 7, 28),
+            bars=[make_bar()],
+        )
+
+    assert simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 27),
+        bars=[],
+    ) == ()
 
 
 def test_bars_iterable_is_materialized_once() -> None:
@@ -523,7 +756,7 @@ def test_fill_decimal_fields_reject_non_finite_values(field: str, value: Decimal
 
 @pytest.mark.parametrize("invalid", [datetime(2026, 7, 27), "2026-07-27"])
 def test_fill_session_date_requires_plain_date(invalid: object) -> None:
-    with pytest.raises((TypeError, ValidationError)):
+    with pytest.raises(ValidationError):
         make_fill(
             status=FillStatus.FILLED,
             filled_quantity=Decimal("10"),
