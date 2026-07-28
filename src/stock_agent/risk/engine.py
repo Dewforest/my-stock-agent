@@ -1,5 +1,19 @@
 from collections.abc import Mapping
-from decimal import Decimal
+from decimal import (
+    ROUND_HALF_EVEN,
+    Clamped,
+    Context,
+    Decimal,
+    DecimalException,
+    DivisionByZero,
+    FloatOperation,
+    Inexact,
+    InvalidOperation,
+    Overflow,
+    Rounded,
+    Subnormal,
+    Underflow,
+)
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
 
@@ -13,7 +27,28 @@ from pydantic import (
     model_validator,
 )
 
-from stock_agent.domain import Instrument, PortfolioSnapshot, Position, StrategyIntent
+from stock_agent.domain import Instrument, PortfolioSnapshot, Position, Side, StrategyIntent
+
+_MARKET_MISMATCH = "MARKET_MISMATCH"
+_ZERO_NAV_BUY_BLOCK = "ZERO_NAV_BUY_BLOCK"
+_DRAWDOWN_BUY_BLOCK_15 = "DRAWDOWN_BUY_BLOCK_15"
+_DRAWDOWN_RISK_REDUCTION_20 = "DRAWDOWN_RISK_REDUCTION_20"
+_DRAWDOWN_BUY_THRESHOLD = Decimal("0.15")
+_DRAWDOWN_REDUCTION_THRESHOLD = Decimal("0.20")
+_TWO = Decimal(2)
+_DECIMAL_CONTEXT = Context(
+    prec=128,
+    rounding=ROUND_HALF_EVEN,
+    Emin=-999999999999999999,
+    Emax=999999999999999999,
+    capitals=1,
+    clamp=0,
+    flags=[],
+    traps=[InvalidOperation, DivisionByZero, Overflow],
+)
+# Context() receives every signal explicitly through these two exhaustive groups.
+for _signal in (Clamped, FloatOperation, Inexact, Rounded, Subnormal, Underflow):
+    _DECIMAL_CONTEXT.traps[_signal] = False
 
 
 def _finite_decimal(value: object) -> Decimal:
@@ -159,3 +194,81 @@ class RiskDecision(_ImmutableModel):
 
 class RiskEngine:
     __slots__ = ()
+
+    def evaluate(self, intent: StrategyIntent, context: RiskContext) -> RiskDecision:
+        if type(intent) is not StrategyIntent:
+            raise TypeError("intent must be exactly StrategyIntent")
+        if type(context) is not RiskContext:
+            raise TypeError("context must be exactly RiskContext")
+        if intent.market != context.portfolio.market:
+            return RiskDecision(
+                original_intent=intent,
+                status=RiskDecisionStatus.REJECTED,
+                approved_target_weight=None,
+                rule_ids=(_MARKET_MISMATCH,),
+                reasons=("intent market does not match portfolio market",),
+            )
+        decimal_context = _DECIMAL_CONTEXT.copy()
+        portfolio = context.portfolio
+        try:
+            drawdown = (
+                Decimal(0)
+                if portfolio.peak_nav == 0
+                else decimal_context.divide(
+                    decimal_context.subtract(portfolio.peak_nav, portfolio.nav),
+                    portfolio.peak_nav,
+                )
+            )
+            total_position_value = Decimal(0)
+            for position in portfolio.positions:
+                total_position_value = decimal_context.add(
+                    total_position_value, position.market_value
+                )
+            current_gross = (
+                Decimal(0)
+                if portfolio.nav == 0
+                else decimal_context.divide(total_position_value, portfolio.nav)
+            )
+            target_gross = decimal_context.divide(current_gross, _TWO)
+        except DecimalException:
+            raise ValueError("risk arithmetic failed") from None
+
+        rule_ids: list[str] = []
+        reasons: list[str] = []
+        reduction = None
+        if drawdown >= _DRAWDOWN_REDUCTION_THRESHOLD:
+            reduction = RiskReductionTarget(
+                current_gross_exposure=current_gross,
+                target_gross_exposure=target_gross,
+                review_required=True,
+            )
+            rule_ids.append(_DRAWDOWN_RISK_REDUCTION_20)
+            reasons.append("drawdown of twenty percent or more requires gross exposure review")
+
+        if intent.side is Side.BUY and drawdown >= _DRAWDOWN_BUY_THRESHOLD:
+            rule_ids.append(_DRAWDOWN_BUY_BLOCK_15)
+            reasons.append("buy blocked at drawdown of fifteen percent or more")
+            return RiskDecision(
+                original_intent=intent,
+                status=RiskDecisionStatus.REJECTED,
+                approved_target_weight=None,
+                rule_ids=tuple(rule_ids),
+                reasons=tuple(reasons),
+                risk_reduction=reduction,
+            )
+        if intent.side is Side.BUY and portfolio.nav == 0:
+            return RiskDecision(
+                original_intent=intent,
+                status=RiskDecisionStatus.REJECTED,
+                approved_target_weight=None,
+                rule_ids=(_ZERO_NAV_BUY_BLOCK,),
+                reasons=("buy blocked because portfolio NAV is zero",),
+            )
+        return RiskDecision(
+            original_intent=intent,
+            status=RiskDecisionStatus.APPROVED,
+            approved_target_weight=intent.target_weight,
+            rule_ids=tuple(rule_ids),
+            reasons=tuple(reasons),
+            risk_reduction=reduction,
+        )
