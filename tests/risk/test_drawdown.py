@@ -141,6 +141,21 @@ def test_buy_below_fifteen_percent_drawdown_is_approved() -> None:
     assert decision.reasons == ()
 
 
+def test_buy_one_e_minus_200_below_fifteen_percent_drawdown_is_approved() -> None:
+    original = intent(target_weight="0.375")
+    nav = "0.85" + "0" * 199 + "1"
+    with localcontext() as construction_context:
+        construction_context.prec = 256
+        snapshot = portfolio(cash=nav, nav=nav, peak_nav="1")
+
+    decision = RiskEngine().evaluate(original, context(snapshot))
+
+    assert decision.status is RiskDecisionStatus.APPROVED
+    assert decision.approved_target_weight is original.target_weight
+    assert decision.rule_ids == ()
+    assert decision.reasons == ()
+
+
 def test_sell_at_fifteen_percent_drawdown_remains_permitted() -> None:
     original = intent(Side.SELL, target_weight="0")
     decision = RiskEngine().evaluate(
@@ -163,6 +178,43 @@ def invested_portfolio_at_twenty_percent_drawdown() -> PortfolioSnapshot:
         market_value=Decimal("480"),
     )
     return portfolio(cash="320", nav="800", peak_nav="1000", positions=(holding,))
+
+
+def high_precision_invested_portfolio() -> PortfolioSnapshot:
+    with localcontext() as construction_context:
+        construction_context.prec = 500
+        repeated_value = Decimal(1) / Decimal(151) + Decimal(44).scaleb(-131)
+        construction_context.prec = 1000
+        invested = Decimal(1) - Decimal("1e-200")
+        final_value = invested - repeated_value * Decimal(150)
+        positions = tuple(
+            Position(
+                symbol=f"P{index}",
+                quantity=Decimal(1),
+                average_cost=market_value,
+                market_value=market_value,
+            )
+            for index, market_value in enumerate(
+                (*([repeated_value] * 150), final_value)
+            )
+        )
+        return portfolio(
+            cash="1e-200",
+            nav="1",
+            peak_nav="1.25",
+            positions=positions,
+        )
+
+
+def test_true_gross_below_one_does_not_leak_validation_error() -> None:
+    decision = RiskEngine().evaluate(
+        intent(Side.HOLD, target_weight="0.4"),
+        context(high_precision_invested_portfolio()),
+    )
+
+    assert decision.risk_reduction is not None
+    assert Decimal(0) <= decision.risk_reduction.current_gross_exposure <= Decimal(1)
+    assert decision.risk_reduction.current_gross_exposure < Decimal(1)
 
 
 def test_exact_twenty_percent_drawdown_halves_current_gross_exposure() -> None:

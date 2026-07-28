@@ -1,5 +1,7 @@
 from collections.abc import Mapping
 from decimal import (
+    MAX_EMAX,
+    MIN_EMIN,
     ROUND_HALF_EVEN,
     Clamped,
     Context,
@@ -23,6 +25,7 @@ from pydantic import (
     ConfigDict,
     Field,
     InstanceOf,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -33,22 +36,68 @@ _MARKET_MISMATCH = "MARKET_MISMATCH"
 _ZERO_NAV_BUY_BLOCK = "ZERO_NAV_BUY_BLOCK"
 _DRAWDOWN_BUY_BLOCK_15 = "DRAWDOWN_BUY_BLOCK_15"
 _DRAWDOWN_RISK_REDUCTION_20 = "DRAWDOWN_RISK_REDUCTION_20"
-_DRAWDOWN_BUY_THRESHOLD = Decimal("0.15")
-_DRAWDOWN_REDUCTION_THRESHOLD = Decimal("0.20")
 _TWO = Decimal(2)
-_DECIMAL_CONTEXT = Context(
-    prec=128,
-    rounding=ROUND_HALF_EVEN,
-    Emin=-999999999999999999,
-    Emax=999999999999999999,
-    capitals=1,
-    clamp=0,
-    flags=[],
-    traps=[InvalidOperation, DivisionByZero, Overflow],
-)
-# Context() receives every signal explicitly through these two exhaustive groups.
-for _signal in (Clamped, FloatOperation, Inexact, Rounded, Subnormal, Underflow):
-    _DECIMAL_CONTEXT.traps[_signal] = False
+_FIFTEEN_PERCENT_LOSS_MULTIPLIER = Decimal(20)
+_FIFTEEN_PERCENT_PEAK_MULTIPLIER = Decimal(3)
+_TWENTY_PERCENT_LOSS_MULTIPLIER = Decimal(5)
+
+
+def _arithmetic_context_for(*values: Decimal) -> Context:
+    if any(not value.is_finite() for value in values):
+        raise ValueError("arithmetic values must be finite")
+    tuples = [value.as_tuple() for value in values]
+    exponents: list[int] = []
+    for value_tuple in tuples:
+        if not isinstance(value_tuple.exponent, int):
+            raise ValueError("arithmetic values must be finite")
+        exponents.append(value_tuple.exponent)
+    highest_adjusted = max((value.adjusted() for value in values), default=0)
+    lowest_exponent = min(exponents, default=0)
+    span = highest_adjusted - lowest_exponent + 1
+    coefficient_digits = sum(max(1, len(value_tuple.digits)) for value_tuple in tuples)
+    context = Context(
+        prec=max(128, span + 32, coefficient_digits + 32),
+        rounding=ROUND_HALF_EVEN,
+        Emin=MIN_EMIN,
+        Emax=MAX_EMAX,
+        capitals=1,
+        clamp=0,
+        flags=[],
+        traps=[InvalidOperation, DivisionByZero, Overflow],
+    )
+    for signal in (Clamped, FloatOperation, Inexact, Rounded, Subnormal, Underflow):
+        context.traps[signal] = False
+    return context
+
+
+def _drawdown_thresholds(peak_nav: Decimal, nav: Decimal) -> tuple[bool, bool]:
+    if peak_nav == 0:
+        return False, False
+    arithmetic = _arithmetic_context_for(
+        peak_nav,
+        nav,
+        _FIFTEEN_PERCENT_LOSS_MULTIPLIER,
+        _FIFTEEN_PERCENT_PEAK_MULTIPLIER,
+        _TWENTY_PERCENT_LOSS_MULTIPLIER,
+    )
+    loss = arithmetic.subtract(peak_nav, nav)
+    at_fifteen_percent = arithmetic.multiply(
+        loss, _FIFTEEN_PERCENT_LOSS_MULTIPLIER
+    ) >= arithmetic.multiply(peak_nav, _FIFTEEN_PERCENT_PEAK_MULTIPLIER)
+    at_twenty_percent = arithmetic.multiply(
+        loss, _TWENTY_PERCENT_LOSS_MULTIPLIER
+    ) >= peak_nav
+    return at_fifteen_percent, at_twenty_percent
+
+
+def _gross_exposure(nav: Decimal, cash: Decimal) -> Decimal:
+    arithmetic = _arithmetic_context_for(nav, cash)
+    invested = arithmetic.subtract(nav, cash)
+    if invested < 0 or invested > nav:
+        raise ValueError("invested value must be between zero and NAV")
+    if nav == 0:
+        return Decimal(0)
+    return arithmetic.divide(invested, nav)
 
 
 def _finite_decimal(value: object) -> Decimal:
@@ -208,44 +257,33 @@ class RiskEngine:
                 rule_ids=(_MARKET_MISMATCH,),
                 reasons=("intent market does not match portfolio market",),
             )
-        decimal_context = _DECIMAL_CONTEXT.copy()
         portfolio = context.portfolio
         try:
-            drawdown = (
-                Decimal(0)
-                if portfolio.peak_nav == 0
-                else decimal_context.divide(
-                    decimal_context.subtract(portfolio.peak_nav, portfolio.nav),
-                    portfolio.peak_nav,
-                )
+            at_fifteen_percent, at_twenty_percent = _drawdown_thresholds(
+                portfolio.peak_nav, portfolio.nav
             )
-            total_position_value = Decimal(0)
-            for position in portfolio.positions:
-                total_position_value = decimal_context.add(
-                    total_position_value, position.market_value
-                )
-            current_gross = (
-                Decimal(0)
-                if portfolio.nav == 0
-                else decimal_context.divide(total_position_value, portfolio.nav)
-            )
-            target_gross = decimal_context.divide(current_gross, _TWO)
-        except DecimalException:
-            raise ValueError("risk arithmetic failed") from None
+            current_gross = _gross_exposure(portfolio.nav, portfolio.cash)
+            target_context = _arithmetic_context_for(current_gross, _TWO)
+            target_gross = target_context.divide(current_gross, _TWO)
+        except DecimalException as error:
+            raise ValueError("risk arithmetic failed") from error
 
         rule_ids: list[str] = []
         reasons: list[str] = []
         reduction = None
-        if drawdown >= _DRAWDOWN_REDUCTION_THRESHOLD:
-            reduction = RiskReductionTarget(
-                current_gross_exposure=current_gross,
-                target_gross_exposure=target_gross,
-                review_required=True,
-            )
+        if at_twenty_percent:
+            try:
+                reduction = RiskReductionTarget(
+                    current_gross_exposure=current_gross,
+                    target_gross_exposure=target_gross,
+                    review_required=True,
+                )
+            except (DecimalException, ValidationError) as error:
+                raise ValueError("risk arithmetic failed") from error
             rule_ids.append(_DRAWDOWN_RISK_REDUCTION_20)
             reasons.append("drawdown of twenty percent or more requires gross exposure review")
 
-        if intent.side is Side.BUY and drawdown >= _DRAWDOWN_BUY_THRESHOLD:
+        if intent.side is Side.BUY and at_fifteen_percent:
             rule_ids.append(_DRAWDOWN_BUY_BLOCK_15)
             reasons.append("buy blocked at drawdown of fifteen percent or more")
             return RiskDecision(
