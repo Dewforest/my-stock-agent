@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 import stock_agent.account as account
 from stock_agent.account import (
+    AcquisitionLot,
     BuyFilled,
     CashAdjusted,
     CashInitialized,
@@ -292,6 +293,65 @@ def test_ledger_events_are_frozen_and_forbid_extra_fields() -> None:
         make_cash_initialized(source="wire")
 
 
+def make_acquisition_lot(**overrides: object) -> AcquisitionLot:
+    values = {
+        "symbol": " aapl ",
+        "acquired_session": date(2026, 7, 28),
+        "quantity": Decimal("1.1234567890123456789"),
+        "cost_basis": Decimal("100.1234567890123456789"),
+    }
+    values.update(overrides)
+    return AcquisitionLot(**values)
+
+
+def test_acquisition_lot_is_canonical_exact_frozen_and_forbids_extra_fields() -> None:
+    lot = make_acquisition_lot()
+
+    assert lot.symbol == "AAPL"
+    assert lot.quantity == Decimal("1.1234567890123456789")
+    assert lot.cost_basis == Decimal("100.1234567890123456789")
+    with pytest.raises(ValidationError):
+        lot.quantity = Decimal("2")
+    with pytest.raises(ValidationError):
+        make_acquisition_lot(source_event_id="buy-1")
+
+
+@pytest.mark.parametrize("field", ["quantity", "cost_basis"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        0,
+        1,
+        1.0,
+        "1",
+        Decimal("0"),
+        Decimal("-1"),
+        Decimal("NaN"),
+        Decimal("sNaN"),
+        Decimal("Infinity"),
+        Decimal("-Infinity"),
+    ],
+)
+def test_acquisition_lot_requires_strict_finite_positive_decimals(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        make_acquisition_lot(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("symbol", "   "),
+        ("acquired_session", datetime(2026, 7, 28, tzinfo=UTC)),
+        ("acquired_session", "2026-07-28"),
+    ],
+)
+def test_acquisition_lot_rejects_invalid_identity_fields(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        make_acquisition_lot(**{field: value})
+
+
 def test_ledger_event_is_exact_python_union() -> None:
     assert isinstance(LedgerEvent, UnionType)
     assert get_args(LedgerEvent) == (
@@ -306,6 +366,7 @@ def test_ledger_event_is_exact_python_union() -> None:
 
 def test_account_exports_exact_public_contract() -> None:
     assert account.__all__ == [
+        "AcquisitionLot",
         "CashInitialized",
         "BuyFilled",
         "SellFilled",

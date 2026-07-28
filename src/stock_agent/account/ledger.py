@@ -65,6 +65,35 @@ PositiveDecimal = Annotated[SupportedDecimal, Field(gt=0)]
 NonNegativeDecimal = Annotated[SupportedDecimal, Field(ge=0)]
 
 
+def _validate_finite_decimal(value: object) -> Decimal:
+    if type(value) is not Decimal:
+        raise ValueError("value must be a Decimal")
+    if not value.is_finite():
+        raise ValueError("value must be finite")
+    return value
+
+
+LotPositiveDecimal = Annotated[
+    Decimal, BeforeValidator(_validate_finite_decimal), Field(gt=0)
+]
+
+
+class AcquisitionLot(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    symbol: Symbol
+    acquired_session: date
+    quantity: LotPositiveDecimal
+    cost_basis: LotPositiveDecimal
+
+    @field_validator("acquired_session", mode="before")
+    @classmethod
+    def acquired_session_is_plain_date(cls, value: object) -> object:
+        if type(value) is not date:
+            raise ValueError("acquired_session must be a plain date")
+        return value
+
+
 class _LedgerEvent(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -153,10 +182,16 @@ _ARITHMETIC_CONTEXT = Context(
 )
 
 
-class _Holding:
-    def __init__(self, quantity: Decimal, cost_basis: Decimal, mark_price: Decimal) -> None:
+class _Lot:
+    def __init__(self, acquired_session: date, quantity: Decimal, cost_basis: Decimal) -> None:
+        self.acquired_session = acquired_session
         self.quantity = quantity
         self.cost_basis = cost_basis
+
+
+class _Holding:
+    def __init__(self, lots: list[_Lot], mark_price: Decimal) -> None:
+        self.lots = lots
         self.mark_price = mark_price
 
 
@@ -176,6 +211,7 @@ class PortfolioLedger:
         self._cash: Decimal | None = None
         self._realized_pnl: Decimal | None = None
         self._positions: tuple[Position, ...] | None = None
+        self._lots: tuple[AcquisitionLot, ...] | None = None
         self._snapshot: PortfolioSnapshot | None = None
 
     @property
@@ -208,6 +244,12 @@ class PortfolioLedger:
             raise RuntimeError("cash has not been initialized")
         return self._positions
 
+    @property
+    def lots(self) -> tuple[AcquisitionLot, ...]:
+        if self._lots is None:
+            raise RuntimeError("cash has not been initialized")
+        return self._lots
+
     def snapshot(self, as_of: datetime | None = None) -> PortfolioSnapshot:
         if as_of is None:
             if self._snapshot is None:
@@ -228,7 +270,7 @@ class PortfolioLedger:
             raise RuntimeError("cash has not been initialized")
         try:
             active_events = self._active_events(prefix)
-            return self._replay(active_events, snapshot_as_of=as_of)[3]
+            return self._replay(active_events, snapshot_as_of=as_of)[4]
         except DecimalException as error:
             raise ValueError("decimal arithmetic failed") from error
 
@@ -254,7 +296,7 @@ class PortfolioLedger:
         candidate = (*self._events, event)
         try:
             active_events = self._active_events(candidate)
-            cash, realized_pnl, positions, snapshot = self._replay(
+            cash, realized_pnl, positions, lots, snapshot = self._replay(
                 active_events, snapshot_as_of=event.occurred_at
             )
         except DecimalException as error:
@@ -264,6 +306,7 @@ class PortfolioLedger:
         self._cash = cash
         self._realized_pnl = realized_pnl
         self._positions = positions
+        self._lots = lots
         self._snapshot = snapshot
 
     def _replay(
@@ -271,7 +314,13 @@ class PortfolioLedger:
         events: tuple[LedgerEvent, ...],
         *,
         snapshot_as_of: datetime,
-    ) -> tuple[Decimal, Decimal, tuple[Position, ...], PortfolioSnapshot]:
+    ) -> tuple[
+        Decimal,
+        Decimal,
+        tuple[Position, ...],
+        tuple[AcquisitionLot, ...],
+        PortfolioSnapshot,
+    ]:
         context = _ARITHMETIC_CONTEXT.copy()
         cash: Decimal | None = None
         realized_pnl = Decimal(0)
@@ -296,18 +345,21 @@ class PortfolioLedger:
                 holding = holdings.get(replayed.symbol)
                 if holding is None:
                     holdings[replayed.symbol] = _Holding(
-                        replayed.quantity, cost, replayed.price
+                        [_Lot(replayed.session_date, replayed.quantity, cost)], replayed.price
                     )
                 else:
-                    holding.quantity = context.add(holding.quantity, replayed.quantity)
-                    holding.cost_basis = context.add(holding.cost_basis, cost)
+                    holding.lots.append(_Lot(replayed.session_date, replayed.quantity, cost))
                     holding.mark_price = replayed.price
-                    self._require_finite(holding.quantity, holding.cost_basis)
                 cash = new_cash
             elif isinstance(replayed, SellFilled):
                 assert cash is not None
                 holding = holdings.get(replayed.symbol)
-                if holding is None or replayed.quantity > holding.quantity:
+                held_quantity = (
+                    Decimal(0)
+                    if holding is None
+                    else self._sum_lot_quantity(holding, context)
+                )
+                if holding is None or replayed.quantity > held_quantity:
                     raise ValueError("cannot sell more than the held quantity")
                 proceeds = context.subtract(
                     context.multiply(replayed.quantity, replayed.price), replayed.fees
@@ -315,27 +367,31 @@ class PortfolioLedger:
                 self._require_finite(proceeds)
                 if proceeds < 0:
                     raise ValueError("sell proceeds cannot be negative")
-                if replayed.quantity == holding.quantity:
-                    allocated_cost = holding.cost_basis
-                else:
-                    allocated_cost = context.divide(
-                        context.multiply(holding.cost_basis, replayed.quantity),
-                        holding.quantity,
-                    )
+                allocated_cost = Decimal(0)
+                remaining_to_sell = replayed.quantity
+                while remaining_to_sell > 0:
+                    lot = holding.lots[0]
+                    take = min(remaining_to_sell, lot.quantity)
+                    if take == lot.quantity:
+                        lot_cost = lot.cost_basis
+                        holding.lots.pop(0)
+                    else:
+                        old_quantity = lot.quantity
+                        lot_cost = context.divide(
+                            context.multiply(lot.cost_basis, take), old_quantity
+                        )
+                        lot.quantity = context.subtract(old_quantity, take)
+                        lot.cost_basis = context.subtract(lot.cost_basis, lot_cost)
+                    allocated_cost = context.add(allocated_cost, lot_cost)
+                    remaining_to_sell = context.subtract(remaining_to_sell, take)
                 cash = context.add(cash, proceeds)
                 realized_pnl = context.add(
                     realized_pnl, context.subtract(proceeds, allocated_cost)
                 )
-                remaining_quantity = context.subtract(holding.quantity, replayed.quantity)
-                remaining_cost = context.subtract(holding.cost_basis, allocated_cost)
-                self._require_finite(
-                    allocated_cost, cash, realized_pnl, remaining_quantity, remaining_cost
-                )
-                if remaining_quantity == 0:
+                self._require_finite(allocated_cost, cash, realized_pnl)
+                if not holding.lots:
                     del holdings[replayed.symbol]
                 else:
-                    holding.quantity = remaining_quantity
-                    holding.cost_basis = remaining_cost
                     holding.mark_price = replayed.price
             elif isinstance(replayed, CashAdjusted):
                 assert cash is not None
@@ -372,7 +428,7 @@ class PortfolioLedger:
                 )
 
         assert cash is not None and snapshot is not None
-        return cash, realized_pnl, positions, snapshot
+        return cash, realized_pnl, positions, self._public_lots(holdings), snapshot
 
     @staticmethod
     def _active_events(events: tuple[LedgerEvent, ...]) -> tuple[LedgerEvent, ...]:
@@ -408,15 +464,40 @@ class PortfolioLedger:
         result = []
         for symbol in sorted(holdings):
             holding = holdings[symbol]
-            average_cost = context.divide(holding.cost_basis, holding.quantity)
-            market_value = context.multiply(holding.quantity, holding.mark_price)
+            quantity = PortfolioLedger._sum_lot_quantity(holding, context)
+            cost_basis = Decimal(0)
+            for lot in holding.lots:
+                cost_basis = context.add(cost_basis, lot.cost_basis)
+            average_cost = context.divide(cost_basis, quantity)
+            market_value = context.multiply(quantity, holding.mark_price)
             PortfolioLedger._require_finite(average_cost, market_value)
             result.append(
                 Position(
                     symbol=symbol,
-                    quantity=holding.quantity,
+                    quantity=quantity,
                     average_cost=average_cost,
                     market_value=market_value,
                 )
             )
         return tuple(result)
+
+    @staticmethod
+    def _sum_lot_quantity(holding: _Holding, context: Context) -> Decimal:
+        quantity = Decimal(0)
+        for lot in holding.lots:
+            quantity = context.add(quantity, lot.quantity)
+        PortfolioLedger._require_finite(quantity)
+        return quantity
+
+    @staticmethod
+    def _public_lots(holdings: dict[str, _Holding]) -> tuple[AcquisitionLot, ...]:
+        return tuple(
+            AcquisitionLot(
+                symbol=symbol,
+                acquired_session=lot.acquired_session,
+                quantity=lot.quantity,
+                cost_basis=lot.cost_basis,
+            )
+            for symbol in sorted(holdings)
+            for lot in holdings[symbol].lots
+        )

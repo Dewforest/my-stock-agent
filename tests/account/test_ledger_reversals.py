@@ -74,6 +74,7 @@ def state(ledger: PortfolioLedger) -> tuple[object, ...]:
         ledger.events,
         ledger.cash,
         ledger.positions,
+        ledger.lots,
         ledger.realized_pnl,
         ledger.snapshot(),
     )
@@ -206,7 +207,51 @@ def test_reverse_sell_restores_position_cash_cost_and_realized_pnl() -> None:
     assert ledger.realized_pnl == Decimal("0")
     assert ledger.positions[0].quantity == Decimal("2")
     assert ledger.positions[0].average_cost == Decimal("100.5")
+    assert tuple((lot.quantity, lot.cost_basis) for lot in ledger.lots) == (
+        (Decimal("2"), Decimal("201")),
+    )
     assert ledger.snapshot().nav == Decimal("999")
+
+
+def test_reverse_fifo_sell_restores_original_lot_order_and_costs() -> None:
+    ledger = ledger_with_cash()
+    ledger.append(
+        buy(
+            event_id="buy-1",
+            quantity=Decimal("3"),
+            price=Decimal("10"),
+            fees=Decimal("0.30"),
+            session_date=date(2026, 7, 27),
+        )
+    )
+    ledger.append(
+        buy(
+            event_id="buy-2",
+            seconds=2,
+            quantity=Decimal("2"),
+            price=Decimal("20"),
+            fees=Decimal("0.20"),
+            session_date=date(2026, 7, 28),
+        )
+    )
+    ledger.append(
+        sell(
+            seconds=3,
+            quantity=Decimal("4"),
+            price=Decimal("30"),
+            fees=Decimal("0.10"),
+        )
+    )
+
+    ledger.append(reverse("sell", seconds=4))
+
+    assert tuple(
+        (lot.acquired_session, lot.quantity, lot.cost_basis) for lot in ledger.lots
+    ) == (
+        (date(2026, 7, 27), Decimal("3"), Decimal("30.30")),
+        (date(2026, 7, 28), Decimal("2"), Decimal("40.20")),
+    )
+    assert ledger.realized_pnl == Decimal("0")
 
 
 def test_reverse_dependency_free_buy_removes_position_and_restores_cash() -> None:
@@ -216,7 +261,78 @@ def test_reverse_dependency_free_buy_removes_position_and_restores_cash() -> Non
 
     assert ledger.cash == Decimal("1000")
     assert ledger.positions == ()
+    assert ledger.lots == ()
     assert ledger.snapshot().nav == Decimal("1000")
+
+
+def test_reverse_buy_restores_remaining_lot_order_and_cost() -> None:
+    ledger = ledger_with_cash()
+    first = buy(
+        event_id="buy-1",
+        quantity=Decimal("1"),
+        price=Decimal("100"),
+        fees=Decimal("1"),
+        session_date=date(2026, 7, 27),
+    )
+    second = buy(
+        event_id="buy-2",
+        seconds=2,
+        quantity=Decimal("2"),
+        price=Decimal("110"),
+        fees=Decimal("2"),
+        session_date=date(2026, 7, 28),
+    )
+    ledger.append(first)
+    ledger.append(second)
+    third = buy(
+        event_id="buy-3",
+        seconds=3,
+        quantity=Decimal("3"),
+        price=Decimal("100"),
+        fees=Decimal("3"),
+        session_date=date(2026, 7, 29),
+    )
+    ledger.append(third)
+
+    ledger.append(reverse("buy-2", seconds=4))
+
+    assert tuple(
+        (lot.acquired_session, lot.quantity, lot.cost_basis) for lot in ledger.lots
+    ) == (
+        (date(2026, 7, 27), Decimal("1"), Decimal("101")),
+        (date(2026, 7, 29), Decimal("3"), Decimal("303")),
+    )
+    assert ledger.positions[0].quantity == Decimal("4")
+    assert ledger.positions[0].average_cost == Decimal("101")
+
+
+def test_historical_snapshot_keeps_fifo_aggregate_before_later_sell() -> None:
+    ledger = ledger_with_cash()
+    first = buy(quantity=Decimal("1"), price=Decimal("100"), fees=Decimal("0"))
+    second = buy(
+        event_id="buy-2",
+        seconds=2,
+        quantity=Decimal("1"),
+        price=Decimal("200"),
+        fees=Decimal("0"),
+    )
+    sale = sell(
+        seconds=3,
+        quantity=Decimal("1"),
+        price=Decimal("250"),
+        fees=Decimal("0"),
+    )
+    ledger.append(first)
+    ledger.append(second)
+    ledger.append(sale)
+
+    historical = ledger.snapshot(second.occurred_at)
+
+    assert historical.positions[0].quantity == Decimal("2")
+    assert historical.positions[0].average_cost == Decimal("150")
+    assert ledger.positions[0].quantity == Decimal("1")
+    assert ledger.positions[0].average_cost == Decimal("200")
+    assert ledger.realized_pnl == Decimal("150")
 
 
 def test_historical_snapshot_changes_at_the_inclusive_reversal_boundary() -> None:

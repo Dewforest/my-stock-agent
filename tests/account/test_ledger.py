@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 import stock_agent.account as account
 from stock_agent.account import (
+    AcquisitionLot,
     BuyFilled,
     CashAdjusted,
     CashInitialized,
@@ -75,7 +76,7 @@ def test_cash_initialization_exposes_the_first_atomic_snapshot() -> None:
         amount=Decimal("1000.00"),
     )
 
-    for attribute in ("cash", "positions", "realized_pnl"):
+    for attribute in ("cash", "positions", "lots", "realized_pnl"):
         with pytest.raises(RuntimeError):
             getattr(ledger, attribute)
     with pytest.raises(RuntimeError):
@@ -139,7 +140,7 @@ def test_mark_updates_market_value_nav_and_peak_only() -> None:
     assert ledger.snapshot().peak_nav == Decimal("1019")
 
 
-def test_partial_sell_allocates_average_cost_and_fees_against_realized_pnl() -> None:
+def test_partial_sell_allocates_fifo_cost_and_fees_against_realized_pnl() -> None:
     ledger = initialized_ledger()
     ledger.append(buy_event())
 
@@ -152,6 +153,47 @@ def test_partial_sell_allocates_average_cost_and_fees_against_realized_pnl() -> 
     assert ledger.positions[0].market_value == Decimal("120")
     assert ledger.snapshot().nav == Decimal("1037")
     assert ledger.snapshot().peak_nav == Decimal("1037")
+
+
+def test_partial_sell_uses_fifo_and_preserves_remaining_acquisition_lots() -> None:
+    ledger = initialized_ledger()
+    ledger.append(
+        buy_event(
+            quantity=Decimal("3"),
+            price=Decimal("10"),
+            fees=Decimal("0.30"),
+            session_date=date(2026, 7, 27),
+        )
+    )
+    ledger.append(
+        buy_event(
+            event_id="buy-2",
+            seconds=2,
+            quantity=Decimal("2"),
+            price=Decimal("20"),
+            fees=Decimal("0.20"),
+        )
+    )
+
+    ledger.append(
+        sell_event(
+            seconds=3,
+            quantity=Decimal("1"),
+            price=Decimal("30"),
+            fees=Decimal("0.10"),
+        )
+    )
+
+    assert ledger.realized_pnl == Decimal("19.80")
+    assert tuple(
+        (lot.symbol, lot.acquired_session, lot.quantity, lot.cost_basis)
+        for lot in ledger.lots
+    ) == (
+        ("AAPL", date(2026, 7, 27), Decimal("2"), Decimal("20.20")),
+        ("AAPL", date(2026, 7, 28), Decimal("2"), Decimal("40.20")),
+    )
+    assert ledger.positions[0].quantity == Decimal("4")
+    assert ledger.positions[0].average_cost == Decimal("15.10")
 
 
 def test_cash_adjustment_changes_cash_and_nav_but_not_realized_pnl() -> None:
@@ -179,6 +221,7 @@ def ledger_state(ledger: PortfolioLedger) -> tuple[object, ...]:
         ledger.events,
         ledger.cash,
         ledger.positions,
+        ledger.lots,
         ledger.realized_pnl,
         ledger.snapshot(),
     )
@@ -205,7 +248,7 @@ def test_full_sell_removes_position_without_cost_residue() -> None:
     assert ledger.snapshot().peak_nav == Decimal("1046")
 
 
-def test_multiple_buys_use_moving_weighted_average_and_latest_fill_mark() -> None:
+def test_multiple_buys_project_weighted_average_and_latest_fill_mark() -> None:
     ledger = initialized_ledger()
     ledger.append(buy_event())
     ledger.append(
@@ -224,6 +267,108 @@ def test_multiple_buys_use_moving_weighted_average_and_latest_fill_mark() -> Non
     assert ledger.positions[0].market_value == Decimal("550")
     assert ledger.snapshot().nav == Decimal("1017")
     assert ledger.snapshot().peak_nav == Decimal("1017")
+
+
+def test_consecutive_fifo_sells_cross_lots_and_finish_without_residue() -> None:
+    ledger = initialized_ledger()
+    ledger.append(
+        buy_event(quantity=Decimal("3"), price=Decimal("10"), fees=Decimal("0.30"))
+    )
+    ledger.append(
+        buy_event(
+            event_id="buy-2",
+            seconds=2,
+            quantity=Decimal("2"),
+            price=Decimal("20"),
+            fees=Decimal("0.20"),
+        )
+    )
+    ledger.append(
+        sell_event(
+            event_id="sell-1",
+            seconds=3,
+            quantity=Decimal("2"),
+            price=Decimal("30"),
+            fees=Decimal("0.10"),
+        )
+    )
+
+    assert ledger.realized_pnl == Decimal("39.70")
+    assert tuple((lot.quantity, lot.cost_basis) for lot in ledger.lots) == (
+        (Decimal("1"), Decimal("10.10")),
+        (Decimal("2"), Decimal("40.20")),
+    )
+
+    ledger.append(
+        sell_event(
+            event_id="sell-2",
+            seconds=4,
+            quantity=Decimal("2"),
+            price=Decimal("25"),
+            fees=Decimal("0.10"),
+        )
+    )
+
+    assert ledger.realized_pnl == Decimal("59.40")
+    assert tuple((lot.quantity, lot.cost_basis) for lot in ledger.lots) == (
+        (Decimal("1"), Decimal("20.10")),
+    )
+
+    ledger.append(
+        sell_event(
+            event_id="sell-3",
+            seconds=5,
+            quantity=Decimal("1"),
+            price=Decimal("22"),
+            fees=Decimal("0.10"),
+        )
+    )
+
+    assert ledger.cash == Decimal("1061.20")
+    assert ledger.realized_pnl == Decimal("61.20")
+    assert ledger.lots == ()
+    assert ledger.positions == ()
+    assert ledger.snapshot().nav == Decimal("1061.20")
+
+
+def test_lots_distinguish_equal_aggregate_positions_by_acquisition_session() -> None:
+    split = initialized_ledger("10000")
+    split.append(
+        buy_event(
+            quantity=Decimal("100"),
+            price=Decimal("10"),
+            fees=Decimal("0"),
+            session_date=date(2026, 7, 27),
+        )
+    )
+    split.append(
+        buy_event(
+            event_id="buy-2",
+            seconds=2,
+            quantity=Decimal("100"),
+            price=Decimal("10"),
+            fees=Decimal("0"),
+            session_date=date(2026, 7, 28),
+        )
+    )
+    combined = initialized_ledger("10000")
+    combined.append(
+        buy_event(
+            quantity=Decimal("200"),
+            price=Decimal("10"),
+            fees=Decimal("0"),
+            session_date=date(2026, 7, 27),
+        )
+    )
+
+    assert split.positions == combined.positions
+    assert tuple((lot.acquired_session, lot.quantity) for lot in split.lots) == (
+        (date(2026, 7, 27), Decimal("100")),
+        (date(2026, 7, 28), Decimal("100")),
+    )
+    assert tuple((lot.acquired_session, lot.quantity) for lot in combined.lots) == (
+        (date(2026, 7, 27), Decimal("200")),
+    )
 
 
 def test_financial_replay_failures_are_atomic() -> None:
@@ -328,11 +473,15 @@ def test_positions_are_sorted_and_returned_objects_are_immutable() -> None:
     assert tuple(position.symbol for position in ledger.positions) == ("AAPL", "MSFT")
     assert isinstance(ledger.events, tuple)
     assert isinstance(ledger.positions, tuple)
+    assert isinstance(ledger.lots, tuple)
+    assert tuple(lot.symbol for lot in ledger.lots) == ("AAPL", "MSFT")
     assert ledger.snapshot().positions == ledger.positions
     with pytest.raises(ValidationError):
         ledger.positions[0].quantity = Decimal("99")
     with pytest.raises(ValidationError):
         ledger.snapshot().cash = Decimal("0")
+    with pytest.raises(ValidationError):
+        ledger.lots[0].quantity = Decimal("99")
 
 
 def test_private_decimal_context_ignores_hostile_ambient_context() -> None:
@@ -398,5 +547,7 @@ def test_ledger_requires_strict_market(market: object) -> None:
 
 
 def test_public_export_includes_portfolio_ledger() -> None:
+    assert "AcquisitionLot" in account.__all__
+    assert account.AcquisitionLot is AcquisitionLot
     assert account.__all__[-1] == "PortfolioLedger"
     assert account.PortfolioLedger is PortfolioLedger
