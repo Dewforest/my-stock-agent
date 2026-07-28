@@ -154,6 +154,28 @@ def _compare_decimal_products(a: Decimal, b: Decimal, c: Decimal, d: Decimal) ->
     )
 
 
+def _multiply_decimals_exact(left: Decimal, right: Decimal) -> Decimal:
+    left_tuple = left.as_tuple()
+    right_tuple = right.as_tuple()
+    left_exponent = left_tuple.exponent
+    right_exponent = right_tuple.exponent
+    if not isinstance(left_exponent, int) or not isinstance(right_exponent, int):
+        raise ValueError("multiplication values must be finite")
+    coefficient = int("".join(map(str, left_tuple.digits))) * int(
+        "".join(map(str, right_tuple.digits))
+    )
+    digits = tuple(map(int, str(coefficient)))
+    return Decimal((left_tuple.sign ^ right_tuple.sign, digits, left_exponent + right_exponent))
+
+
+def _add_decimals_exact(left: Decimal, right: Decimal) -> Decimal:
+    if not left:
+        return right
+    if not right:
+        return left
+    return _arithmetic_context_for(left, right).add(left, right)
+
+
 def _drawdown_thresholds(peak_nav: Decimal, nav: Decimal) -> tuple[bool, bool]:
     if peak_nav == 0:
         return False, False
@@ -208,23 +230,35 @@ def _sector_room(
     intent: StrategyIntent,
     portfolio: PortfolioSnapshot,
     instruments_by_symbol: Mapping[str, Instrument],
+    reserved_target_weights: Mapping[str, Decimal],
 ) -> Decimal:
     intent_sector = instruments_by_symbol[intent.symbol].sector.strip().casefold()
     same_sector_values = tuple(
         position.market_value
         for position in portfolio.positions
         if position.symbol != intent.symbol
+        and position.symbol not in reserved_target_weights
         and instruments_by_symbol[position.symbol].sector.strip().casefold() == intent_sector
     )
-    if not same_sector_values:
+    same_sector_reserved_weights = tuple(
+        target_weight
+        for symbol, target_weight in reserved_target_weights.items()
+        if symbol != intent.symbol
+        and instruments_by_symbol[symbol].sector.strip().casefold() == intent_sector
+    )
+    if not same_sector_values and not same_sector_reserved_weights:
         return _SECTOR_EXPOSURE_LIMIT
     arithmetic = _arithmetic_context_for(portfolio.nav, *same_sector_values)
     same_sector_value = Decimal(0)
     for market_value in same_sector_values:
         same_sector_value = arithmetic.add(same_sector_value, market_value)
-    ratio_context = arithmetic.copy()
-    ratio_context.rounding = ROUND_CEILING
-    other_sector_weight = ratio_context.divide(same_sector_value, portfolio.nav)
+    other_sector_weight = Decimal(0)
+    if same_sector_value:
+        ratio_context = arithmetic.copy()
+        ratio_context.rounding = ROUND_CEILING
+        other_sector_weight = ratio_context.divide(same_sector_value, portfolio.nav)
+    for reserved_weight in same_sector_reserved_weights:
+        other_sector_weight = _add_decimals_exact(other_sector_weight, reserved_weight)
     weight_context = _arithmetic_context_for(
         _SECTOR_EXPOSURE_LIMIT, other_sector_weight
     )
@@ -372,7 +406,12 @@ class RiskDecision(_ImmutableModel):
         return self
 
 
-def _evaluate_buy_exposure(intent: StrategyIntent, context: RiskContext) -> RiskDecision:
+def _evaluate_buy_exposure(
+    intent: StrategyIntent,
+    context: RiskContext,
+    reserved_target_weights: Mapping[str, Decimal],
+    committed_notional: Decimal,
+) -> RiskDecision:
     portfolio = context.portfolio
     instruments_by_symbol = {
         instrument.symbol: instrument for instrument in context.instruments
@@ -389,7 +428,8 @@ def _evaluate_buy_exposure(intent: StrategyIntent, context: RiskContext) -> Risk
         )
 
     position_symbols = {position.symbol for position in portfolio.positions}
-    if intent.symbol not in position_symbols and len(position_symbols) >= 10:
+    projected_position_symbols = position_symbols | reserved_target_weights.keys()
+    if intent.symbol not in projected_position_symbols and len(projected_position_symbols) >= 10:
         return RiskDecision(
             original_intent=intent,
             status=RiskDecisionStatus.REJECTED,
@@ -406,7 +446,9 @@ def _evaluate_buy_exposure(intent: StrategyIntent, context: RiskContext) -> Risk
         rule_ids.append(_SINGLE_STOCK_MAX_15)
         reasons.append("buy target exceeds single-stock maximum of fifteen percent")
 
-    sector_room = _sector_room(intent, portfolio, instruments_by_symbol)
+    sector_room = _sector_room(
+        intent, portfolio, instruments_by_symbol, reserved_target_weights
+    )
     if sector_room < approved_target:
         approved_target = max(Decimal(0), sector_room)
         rule_ids.append(_SECTOR_MAX_30)
@@ -417,14 +459,10 @@ def _evaluate_buy_exposure(intent: StrategyIntent, context: RiskContext) -> Risk
         daily_budget = budget_context.multiply(
             context.day_start_available_cash, _DAILY_NEW_POSITION_CASH_LIMIT
         )
-        amount_context = _arithmetic_context_for(
-            daily_budget, context.new_position_notional_committed_today
-        )
+        amount_context = _arithmetic_context_for(daily_budget, committed_notional)
         remaining = max(
             Decimal(0),
-            amount_context.subtract(
-                daily_budget, context.new_position_notional_committed_today
-            ),
+            amount_context.subtract(daily_budget, committed_notional),
         )
         budget_is_binding = (
             _compare_decimal_products(
@@ -460,11 +498,68 @@ def _evaluate_buy_exposure(intent: StrategyIntent, context: RiskContext) -> Risk
 class RiskEngine:
     __slots__ = ()
 
+    def evaluate_many(
+        self, intents: tuple[StrategyIntent, ...], context: RiskContext
+    ) -> tuple[RiskDecision, ...]:
+        if type(context) is not RiskContext:
+            raise TypeError("context must be exactly RiskContext")
+        if type(intents) is not tuple:
+            raise TypeError("intents must be exactly tuple")
+        if any(type(intent) is not StrategyIntent for intent in intents):
+            raise TypeError("intents must contain exactly StrategyIntent values")
+        symbols = tuple(intent.symbol for intent in intents)
+        if len(symbols) != len(set(symbols)):
+            raise ValueError("batch intent symbols must be unique")
+
+        reserved_target_weights: dict[str, Decimal] = {}
+        committed_notional = context.new_position_notional_committed_today
+        starting_symbols = {position.symbol for position in context.portfolio.positions}
+        decisions: list[RiskDecision] = []
+        for intent in intents:
+            decision = self._evaluate(
+                intent, context, reserved_target_weights, committed_notional
+            )
+            decisions.append(decision)
+            approved_target = decision.approved_target_weight
+            if (
+                intent.side is Side.BUY
+                and decision.status
+                in (RiskDecisionStatus.APPROVED, RiskDecisionStatus.CLAMPED)
+                and approved_target is not None
+                and approved_target > 0
+            ):
+                reserved_target_weights[intent.symbol] = approved_target
+                if intent.symbol not in starting_symbols:
+                    try:
+                        approved_notional = _multiply_decimals_exact(
+                            approved_target, context.portfolio.nav
+                        )
+                        committed_notional = _add_decimals_exact(
+                            committed_notional, approved_notional
+                        )
+                    except DecimalException as error:
+                        raise ValueError("risk arithmetic failed") from error
+        return tuple(decisions)
+
     def evaluate(self, intent: StrategyIntent, context: RiskContext) -> RiskDecision:
         if type(intent) is not StrategyIntent:
             raise TypeError("intent must be exactly StrategyIntent")
         if type(context) is not RiskContext:
             raise TypeError("context must be exactly RiskContext")
+        return self._evaluate(
+            intent,
+            context,
+            {},
+            context.new_position_notional_committed_today,
+        )
+
+    def _evaluate(
+        self,
+        intent: StrategyIntent,
+        context: RiskContext,
+        reserved_target_weights: Mapping[str, Decimal],
+        committed_notional: Decimal,
+    ) -> RiskDecision:
         if intent.market != context.portfolio.market:
             return RiskDecision(
                 original_intent=intent,
@@ -520,7 +615,12 @@ class RiskEngine:
             )
         if intent.side is Side.BUY:
             try:
-                return _evaluate_buy_exposure(intent, context)
+                return _evaluate_buy_exposure(
+                    intent,
+                    context,
+                    reserved_target_weights,
+                    committed_notional,
+                )
             except (DecimalException, ValidationError) as error:
                 raise ValueError("risk arithmetic failed") from error
         return RiskDecision(
