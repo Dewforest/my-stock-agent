@@ -40,15 +40,23 @@ def intent(
     )
 
 
-def bar(*, market: Market = Market.CN, symbol: str | None = None) -> Bar:
+def bar(
+    *,
+    market: Market = Market.CN,
+    symbol: str | None = None,
+    open_price: str = "10",
+) -> Bar:
+    price = Decimal(open_price)
+    high = Decimal("11") if open_price == "10" else price
+    low = Decimal("9") if open_price == "10" else price
     return Bar(
         symbol=symbol or ("600000" if market is Market.CN else "AAPL"),
         market=market,
         session_date=D2,
-        open=Decimal("10"),
-        high=Decimal("11"),
-        low=Decimal("9"),
-        close=Decimal("10"),
+        open=price,
+        high=high,
+        low=low,
+        close=price,
         volume=Decimal("1000"),
         available_at=datetime(2026, 7, 28, 8, tzinfo=UTC),
     )
@@ -276,6 +284,145 @@ def test_cn_buy_does_not_make_a_later_same_session_sell_sellable() -> None:
     )
 
     assert [fill.status for fill in fills] == [FillStatus.FILLED, FillStatus.REJECTED]
+
+
+@pytest.mark.parametrize("account_lots", [None, {}, {"account-1": []}])
+def test_us_sell_without_account_lots_is_rejected_instead_of_filling_short(
+    account_lots: Mapping[str, list[AcquisitionLot]] | None,
+) -> None:
+    simulator = ExecutionSimulator({Market.US: calendar(Market.US)})
+    simulator.submit(intent("naked-sell", market=Market.US, side=Side.SELL), D1)
+
+    fill = simulator.process_session(
+        market=Market.US,
+        session_date=D2,
+        bars=[bar(market=Market.US)],
+        account_lots=account_lots,
+    )[0]
+
+    assert fill.status is FillStatus.REJECTED
+    assert fill.filled_quantity == Decimal("0")
+    assert fill.reason and any(
+        fragment in fill.reason.lower() for fragment in ("held", "available", "short")
+    )
+    assert simulator.pending_order_ids == ()
+
+
+def test_us_multiple_sells_share_remaining_held_quantity() -> None:
+    simulator = ExecutionSimulator({Market.US: calendar(Market.US)})
+    simulator.submit(
+        intent("first-us-sell", market=Market.US, side=Side.SELL, quantity="60"), D1
+    )
+    simulator.submit(
+        intent("second-us-sell", market=Market.US, side=Side.SELL, quantity="60"), D1
+    )
+
+    fills = simulator.process_session(
+        market=Market.US,
+        session_date=D2,
+        bars=[bar(market=Market.US)],
+        account_lots={"account-1": [lot("AAPL", D1, "100")]},
+    )
+
+    assert [fill.status for fill in fills] == [FillStatus.FILLED, FillStatus.REJECTED]
+    assert fills[0].filled_quantity == Decimal("60")
+    assert fills[1].reason and any(
+        fragment in fills[1].reason.lower() for fragment in ("held", "available", "short")
+    )
+
+
+def test_us_sell_reservations_are_isolated_by_account_and_symbol() -> None:
+    simulator = ExecutionSimulator({Market.US: calendar(Market.US)})
+    simulator.submit(intent("a-aapl", market=Market.US, side=Side.SELL, quantity="60"), D1)
+    simulator.submit(
+        intent(
+            "b-aapl",
+            market=Market.US,
+            side=Side.SELL,
+            quantity="60",
+            account_id="account-2",
+        ),
+        D1,
+    )
+    simulator.submit(
+        intent("a-msft", market=Market.US, side=Side.SELL, quantity="60", symbol="MSFT"),
+        D1,
+    )
+    simulator.submit(intent("a-aapl-2", market=Market.US, side=Side.SELL, quantity="60"), D1)
+
+    fills = simulator.process_session(
+        market=Market.US,
+        session_date=D2,
+        bars=[bar(market=Market.US), bar(market=Market.US, symbol="MSFT")],
+        account_lots={
+            "account-1": [lot("AAPL", D1, "100"), lot("MSFT", D1, "100")],
+            "account-2": [lot("AAPL", D1, "100")],
+        },
+    )
+
+    assert [fill.status for fill in fills] == [
+        FillStatus.FILLED,
+        FillStatus.FILLED,
+        FillStatus.FILLED,
+        FillStatus.REJECTED,
+    ]
+
+
+def test_us_failed_fee_calculation_does_not_consume_sellable_quantity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    simulator = ExecutionSimulator({Market.US: calendar(Market.US)})
+    simulator.submit(intent("fee-fails-us", market=Market.US, side=Side.SELL), D1)
+    simulator.submit(intent("then-fills-us", market=Market.US, side=Side.SELL), D1)
+    original = simulator._calculate_fees
+    calls = 0
+
+    def fail_once(quantity: Decimal, price: Decimal, bps: Decimal) -> Decimal:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise InvalidOperation
+        return original(quantity, price, bps)
+
+    monkeypatch.setattr(simulator, "_calculate_fees", fail_once)
+    fills = simulator.process_session(
+        market=Market.US,
+        session_date=D2,
+        bars=[bar(market=Market.US)],
+        account_lots={"account-1": [lot("AAPL", D1, "100")]},
+    )
+
+    assert [fill.status for fill in fills] == [FillStatus.REJECTED, FillStatus.FILLED]
+
+
+def test_unsupported_large_fee_does_not_consume_us_sellable_quantity() -> None:
+    simulator = ExecutionSimulator({Market.US: calendar(Market.US)})
+    simulator.submit(
+        intent(
+            "fee-too-large",
+            market=Market.US,
+            side=Side.SELL,
+            quantity="1E25",
+        ),
+        D1,
+    )
+    simulator.submit(
+        intent("uses-unspent-holding", market=Market.US, side=Side.SELL, quantity="1"),
+        D1,
+    )
+
+    fills = simulator.process_session(
+        market=Market.US,
+        session_date=D2,
+        bars=[bar(market=Market.US, open_price="9999999999999999999999999")],
+        account_lots={"account-1": [lot("AAPL", D1, "1E25")]},
+    )
+
+    assert [fill.status for fill in fills] == [FillStatus.REJECTED, FillStatus.FILLED]
+    assert fills[0].reason and "fee" in fills[0].reason.lower()
+    assert fills[0].reason and "numeric" in fills[0].reason.lower()
+    assert fills[1].filled_quantity == Decimal("1")
+    assert simulator.pending_order_ids == ()
 
 
 class HalfQuantityUSRules(USCashEquityRules):

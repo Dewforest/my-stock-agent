@@ -200,12 +200,20 @@ class USCashEquityRules:
     ) -> str | None:
         if side is not Side.BUY and side is not Side.SELL:
             raise ValueError("side must be BUY or SELL")
-        _canonical_symbol(symbol)
-        _validate_session_date(session_date)
-        _validate_decimal(quantity, name="quantity")
-        _validate_lots(acquisition_lots)
+        symbol = _canonical_symbol(symbol)
+        session_date = _validate_session_date(session_date)
+        quantity = _validate_decimal(quantity, name="quantity")
+        acquisition_lots = _validate_lots(acquisition_lots)
         if state is not None:
             raise ValueError("state must be None for US cash equity execution")
+        if side is Side.SELL:
+            available = self.sellable_quantity(
+                symbol=symbol,
+                session_date=session_date,
+                acquisition_lots=acquisition_lots,
+            )
+            if available < quantity:
+                return f"short sale blocked: held/available quantity is {available}"
         return None
 
     def sellable_quantity(

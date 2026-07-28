@@ -1,7 +1,7 @@
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
-from decimal import Context, Decimal, DecimalException, localcontext
+from decimal import ROUND_HALF_EVEN, Context, Decimal, DecimalException
 
 from stock_agent.account import AcquisitionLot
 from stock_agent.domain import Bar, Market, Side
@@ -16,6 +16,7 @@ from stock_agent.market import NoFutureSession, TradingCalendar
 
 _MAX_SUPPORTED_DECIMAL = Decimal("1E26")
 _MAX_DECIMAL_PLACES = 12
+_FEE_QUANTUM = Decimal("0.000000000001")
 _UNSUPPORTED_NUMERIC_REASON = "unsupported numeric range/precision"
 
 
@@ -291,7 +292,7 @@ class ExecutionSimulator:
                 )
                 continue
             sellable_key = (intent.account_id, intent.symbol)
-            if intent.side is Side.SELL and market is Market.CN and block_reason is None:
+            if intent.side is Side.SELL and block_reason is None:
                 if sellable_key not in remaining_sellable:
                     try:
                         remaining_sellable[sellable_key] = rule.sellable_quantity(
@@ -317,7 +318,14 @@ class ExecutionSimulator:
                         )
                         continue
                 if pending.effective_quantity > remaining_sellable[sellable_key]:
-                    block_reason = "sell quantity exceeds remaining T+1 settled quantity"
+                    block_reason = (
+                        "sell quantity exceeds remaining T+1 settled quantity"
+                        if market is Market.CN
+                        else (
+                            "short sale blocked: sell quantity exceeds remaining "
+                            "held/available quantity"
+                        )
+                    )
             if block_reason is not None:
                 fills.append(
                     self._make_fill(
@@ -354,6 +362,16 @@ class ExecutionSimulator:
                     )
                 )
                 continue
+            if not isinstance(fees, Decimal) or not self._is_supported_decimal(fees):
+                fills.append(
+                    self._make_fill(
+                        intent,
+                        FillStatus.REJECTED,
+                        requested_quantity=pending.effective_quantity,
+                        reason=f"fee has {_UNSUPPORTED_NUMERIC_REASON}",
+                    )
+                )
+                continue
 
             fills.append(
                 self._make_fill(
@@ -366,7 +384,7 @@ class ExecutionSimulator:
                     session_date=session_date,
                 )
             )
-            if intent.side is Side.SELL and market is Market.CN:
+            if intent.side is Side.SELL:
                 remaining_sellable[sellable_key] = self._subtract_quantity(
                     remaining_sellable[sellable_key], pending.effective_quantity
                 )
@@ -396,9 +414,16 @@ class ExecutionSimulator:
         coefficient_digits = sum(
             len(value.as_tuple().digits) for value in (quantity, price, bps)
         )
-        context = Context(prec=max(128, coefficient_digits + 16))
-        with localcontext(context):
-            return quantity * price * bps / Decimal("10000")
+        context = Context(
+            prec=max(128, coefficient_digits + 16),
+            rounding=ROUND_HALF_EVEN,
+            Emin=-999999,
+            Emax=999999,
+        )
+        fee = context.divide(
+            context.multiply(context.multiply(quantity, price), bps), Decimal("10000")
+        )
+        return context.quantize(fee, _FEE_QUANTUM)
 
     @staticmethod
     def _subtract_quantity(left: Decimal, right: Decimal) -> Decimal:

@@ -387,16 +387,48 @@ def test_china_requires_matching_session_state(
         )
 
 
-@pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
-def test_us_execution_has_no_market_block(side: Side) -> None:
+def test_us_buy_execution_has_no_market_block_without_holdings() -> None:
     assert (
         USCashEquityRules().execution_block_reason(
-            side=side,
+            side=Side.BUY,
             symbol="AAPL",
             session_date=date(2026, 7, 28),
             quantity=Decimal("0.125"),
             state=None,
             acquisition_lots=(),
+        )
+        is None
+    )
+
+
+def test_us_sell_execution_blocks_quantity_above_held_lots() -> None:
+    rules = USCashEquityRules()
+    session = date(2026, 7, 28)
+
+    reason = rules.execution_block_reason(
+        side=Side.SELL,
+        symbol="AAPL",
+        session_date=session,
+        quantity=Decimal("1.5"),
+        state=None,
+        acquisition_lots=(_lot("AAPL", session, "1.25"),),
+    )
+
+    assert reason is not None
+    assert any(fragment in reason.lower() for fragment in ("held", "available", "short"))
+
+
+def test_us_sell_execution_allows_quantity_equal_to_held_lots() -> None:
+    session = date(2026, 7, 28)
+
+    assert (
+        USCashEquityRules().execution_block_reason(
+            side=Side.SELL,
+            symbol="AAPL",
+            session_date=session,
+            quantity=Decimal("1.25"),
+            state=None,
+            acquisition_lots=(_lot("AAPL", session, "1.25"),),
         )
         is None
     )

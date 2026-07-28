@@ -1,11 +1,12 @@
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import ROUND_CEILING, Decimal, InvalidOperation, localcontext
 
 import pytest
 from pydantic import ValidationError
 
 import stock_agent.execution as execution
+from stock_agent.account import AcquisitionLot, BuyFilled
 from stock_agent.domain import Bar, Market, Side
 from stock_agent.execution import ExecutionSimulator, Fill, FillStatus, OrderIntent
 from stock_agent.execution.cn_rules import CnPriceLimitState, CnSessionState
@@ -132,6 +133,41 @@ def test_default_transaction_costs_are_exact_for_cn_and_us() -> None:
     assert isinstance(us_fill.fees, Decimal)
 
 
+def test_high_precision_fee_can_be_booked_directly_as_buy_filled() -> None:
+    simulator = ExecutionSimulator({Market.US: make_calendar()})
+    simulator.submit(
+        make_intent(quantity=Decimal("1.123456789012")), date(2026, 7, 24)
+    )
+
+    fill = simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 27),
+        bars=[
+            make_bar(
+                open=Decimal("123.45"),
+                high=Decimal("123.45"),
+                low=Decimal("123.45"),
+                close=Decimal("123.45"),
+            )
+        ],
+    )[0]
+
+    assert fill.status is FillStatus.FILLED
+    assert fill.fees == Decimal("0.069345370302")
+    event = BuyFilled(
+        event_id=fill.order_id,
+        account_id=fill.account_id,
+        market=fill.market,
+        occurred_at=datetime(2026, 7, 27, 21, tzinfo=UTC),
+        symbol=fill.symbol,
+        session_date=fill.session_date,
+        quantity=fill.filled_quantity,
+        price=fill.price,
+        fees=fill.fees,
+    )
+    assert event.fees == fill.fees
+
+
 def test_sell_fills_with_overridden_decimal_transaction_cost() -> None:
     simulator = ExecutionSimulator(
         {Market.US: make_calendar()},
@@ -143,6 +179,16 @@ def test_sell_fills_with_overridden_decimal_transaction_cost() -> None:
         market=Market.US,
         session_date=date(2026, 7, 27),
         bars=[make_bar(open=Decimal("101"))],
+        account_lots={
+            "account-1": [
+                AcquisitionLot(
+                    symbol="AAPL",
+                    acquired_session=date(2026, 7, 24),
+                    quantity=Decimal("3"),
+                    cost_basis=Decimal("100"),
+                )
+            ]
+        },
     )[0]
 
     assert fill.side is Side.SELL
@@ -151,38 +197,60 @@ def test_sell_fills_with_overridden_decimal_transaction_cost() -> None:
     assert fill.fees == Decimal("3") * Decimal("101") * Decimal("7.5") / Decimal("10000")
 
 
-def test_fees_are_exact_and_independent_of_ambient_decimal_precision() -> None:
-    quantity = Decimal("99999999999999999999999999.999999999999")
-    open_price = Decimal("99999999999999999999999999.999999999998")
-    bps = Decimal("99999999999999999999999999.999999999997")
-    fees = []
-
-    for precision in (10, 28, 50):
-        with localcontext() as context:
-            context.prec = precision
-            simulator = ExecutionSimulator(
-                {Market.US: make_calendar()},
-                transaction_cost_bps={Market.US: bps},
-            )
-            simulator.submit(make_intent(quantity=quantity), date(2026, 7, 24))
-            fill = simulator.process_session(
-                market=Market.US,
-                session_date=date(2026, 7, 27),
-                bars=[
-                    make_bar(
-                        open=open_price,
-                        high=open_price,
-                        low=open_price,
-                        close=open_price,
-                    )
-                ],
-            )[0]
-            fees.append(fill.fees)
-
+@pytest.mark.parametrize(
+    ("bps", "expected"),
+    [
+        (Decimal("0.000000014"), Decimal("0.000000000001")),
+        (Decimal("0.000000025"), Decimal("0.000000000002")),
+        (Decimal("0.000000035"), Decimal("0.000000000004")),
+    ],
+)
+def test_fee_rounding_is_half_even_and_independent_of_hostile_ambient_context(
+    bps: Decimal,
+    expected: Decimal,
+) -> None:
     with localcontext() as context:
-        context.prec = 128
-        expected = quantity * open_price * bps / Decimal("10000")
-    assert fees == [expected, expected, expected]
+        context.prec = 2
+        context.rounding = ROUND_CEILING
+        for signal in context.traps:
+            context.traps[signal] = False
+        simulator = ExecutionSimulator(
+            {Market.US: make_calendar()},
+            transaction_cost_bps={Market.US: bps},
+        )
+        simulator.submit(make_intent(quantity=Decimal("1")), date(2026, 7, 24))
+        fill = simulator.process_session(
+            market=Market.US,
+            session_date=date(2026, 7, 27),
+            bars=[
+                make_bar(
+                    open=Decimal("1"),
+                    high=Decimal("1"),
+                    low=Decimal("1"),
+                    close=Decimal("1"),
+                )
+            ],
+        )[0]
+
+    assert fill.status is FillStatus.FILLED
+    assert fill.fees == expected
+
+
+def test_zero_fee_quantization_is_allowed() -> None:
+    simulator = ExecutionSimulator(
+        {Market.US: make_calendar()},
+        transaction_cost_bps={Market.US: Decimal("0")},
+    )
+    simulator.submit(make_intent(), date(2026, 7, 24))
+
+    fill = simulator.process_session(
+        market=Market.US,
+        session_date=date(2026, 7, 27),
+        bars=[make_bar()],
+    )[0]
+
+    assert fill.status is FillStatus.FILLED
+    assert fill.fees == Decimal("0")
 
 
 def test_decimal_calculation_exception_becomes_rejected_fill(
