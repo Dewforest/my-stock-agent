@@ -1,6 +1,7 @@
+from collections.abc import Mapping
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -23,6 +24,12 @@ def _finite_decimal(value: object) -> Decimal:
     return value
 
 
+def _exact_true(value: object) -> bool:
+    if not (type(value) is bool and value is True):
+        raise ValueError("value must be exactly True")
+    return value
+
+
 StrictRiskDecimal = Annotated[
     Decimal,
     BeforeValidator(_finite_decimal),
@@ -38,6 +45,13 @@ StrictUnitRiskDecimal = Annotated[
 class _ImmutableModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        if update:
+            raise TypeError("immutable risk models do not support copy updates")
+        return super().model_copy(update=None, deep=deep)
+
 
 class RiskDecisionStatus(StrEnum):
     APPROVED = "APPROVED"
@@ -51,11 +65,20 @@ class RiskContext(_ImmutableModel):
     day_start_available_cash: StrictRiskDecimal
     new_position_notional_committed_today: StrictRiskDecimal
 
+    @field_validator("portfolio", mode="before")
+    @classmethod
+    def portfolio_has_exact_type(cls, value: object) -> object:
+        if type(value) is not PortfolioSnapshot:
+            raise ValueError("portfolio must be a PortfolioSnapshot")
+        return value
+
     @field_validator("instruments", mode="before")
     @classmethod
     def instruments_are_a_tuple(cls, value: object) -> object:
         if type(value) is not tuple:
             raise ValueError("instruments must be a tuple")
+        if any(type(item) is not Instrument for item in value):
+            raise ValueError("instruments must contain Instrument values")
         return value
 
     @model_validator(mode="after")
@@ -71,7 +94,7 @@ class RiskContext(_ImmutableModel):
 class RiskReductionTarget(_ImmutableModel):
     current_gross_exposure: StrictUnitRiskDecimal
     target_gross_exposure: StrictUnitRiskDecimal
-    review_required: Literal[True] = True
+    review_required: Annotated[Literal[True], BeforeValidator(_exact_true)] = True
 
 
 class RiskDecision(_ImmutableModel):
@@ -81,6 +104,13 @@ class RiskDecision(_ImmutableModel):
     rule_ids: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
     risk_reduction: RiskReductionTarget | None = None
+
+    @field_validator("original_intent", mode="before")
+    @classmethod
+    def original_intent_has_exact_type(cls, value: object) -> object:
+        if type(value) is not StrategyIntent:
+            raise ValueError("original_intent must be a StrategyIntent")
+        return value
 
     @field_validator("rule_ids", "reasons", mode="before")
     @classmethod

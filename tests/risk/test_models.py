@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from decimal import ROUND_UP, Decimal, localcontext
 
 import pytest
-from pydantic import ValidationError
+from pydantic import ConfigDict, ValidationError
 
 import stock_agent.risk as risk
 from stock_agent.domain import (
@@ -80,6 +80,34 @@ def context_values(**overrides: object) -> dict[str, object]:
 def test_risk_context_requires_tuple_instruments() -> None:
     with pytest.raises(ValidationError):
         RiskContext(**context_values(instruments=[us_instrument()]))
+
+
+def test_risk_context_rejects_portfolio_subclasses() -> None:
+    class MutablePortfolioSnapshot(PortfolioSnapshot):
+        model_config = ConfigDict(frozen=False)
+
+    portfolio = MutablePortfolioSnapshot(**full_cash_portfolio().model_dump())
+
+    with pytest.raises(ValidationError):
+        RiskContext(**context_values(portfolio=portfolio))
+
+
+def test_risk_context_rejects_tuple_subclasses() -> None:
+    class MutableTuple(tuple[Instrument, ...]):
+        pass
+
+    with pytest.raises(ValidationError):
+        RiskContext(**context_values(instruments=MutableTuple((us_instrument(),))))
+
+
+def test_risk_context_rejects_instrument_subclasses() -> None:
+    class MutableInstrument(Instrument):
+        model_config = ConfigDict(frozen=False)
+
+    instrument = MutableInstrument(**us_instrument().model_dump())
+
+    with pytest.raises(ValidationError):
+        RiskContext(**context_values(instruments=(instrument,)))
 
 
 @pytest.mark.parametrize("field", [
@@ -185,12 +213,13 @@ def test_risk_reduction_target_rejects_invalid_decimals(field: str, value: objec
         RiskReductionTarget(**values)
 
 
-def test_risk_reduction_target_requires_review() -> None:
+@pytest.mark.parametrize("review_required", [False, 1, Decimal("1"), "true"])
+def test_risk_reduction_target_requires_exact_true(review_required: object) -> None:
     with pytest.raises(ValidationError):
         RiskReductionTarget(
             current_gross_exposure=Decimal("0.5"),
             target_gross_exposure=Decimal("0.25"),
-            review_required=False,
+            review_required=review_required,
         )
 
 
@@ -231,6 +260,16 @@ def decision_values(**overrides: object) -> dict[str, object]:
     }
     values.update(overrides)
     return values
+
+
+def test_risk_decision_rejects_strategy_intent_subclasses() -> None:
+    class MutableStrategyIntent(StrategyIntent):
+        model_config = ConfigDict(frozen=False)
+
+    intent = MutableStrategyIntent(**buy_intent().model_dump())
+
+    with pytest.raises(ValidationError):
+        RiskDecision(**decision_values(original_intent=intent))
 
 
 @pytest.mark.parametrize("status", [RiskDecisionStatus.APPROVED, RiskDecisionStatus.CLAMPED])
@@ -349,6 +388,38 @@ def test_risk_decision_is_frozen_and_forbids_extra_fields() -> None:
         RiskDecision(**decision_values(unknown=True))
 
 
+def risk_model_instances() -> tuple[RiskContext, RiskReductionTarget, RiskDecision]:
+    return (
+        RiskContext(**context_values()),
+        RiskReductionTarget(
+            current_gross_exposure=Decimal("0.5"),
+            target_gross_exposure=Decimal("0.25"),
+        ),
+        RiskDecision(**decision_values()),
+    )
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_risk_model_copies_remain_frozen(deep: bool) -> None:
+    for model in risk_model_instances():
+        copied = model.model_copy(deep=deep)
+
+        assert copied == model
+        with pytest.raises(ValidationError):
+            copied.unexpected_state = True
+
+
+def test_risk_models_allow_empty_copy_updates() -> None:
+    for model in risk_model_instances():
+        assert model.model_copy(update={}) == model
+
+
+def test_risk_models_reject_nonempty_copy_updates() -> None:
+    for model in risk_model_instances():
+        with pytest.raises(TypeError):
+            model.model_copy(update={"unexpected_state": True})
+
+
 def test_decimal_validation_is_safe_under_hostile_ambient_context() -> None:
     portfolio = full_cash_portfolio()
     intent = buy_intent()
@@ -421,10 +492,9 @@ def test_risk_package_exports_exact_public_contract() -> None:
     ]
 
 
-def test_risk_engine_is_empty_and_stateless() -> None:
+def test_risk_engine_cannot_store_state() -> None:
     engine = RiskEngine()
     assert RiskEngine.__slots__ == ()
     assert not hasattr(engine, "__dict__")
     with pytest.raises(AttributeError):
         engine.state = "forbidden"
-    assert not hasattr(engine, "evaluate")
