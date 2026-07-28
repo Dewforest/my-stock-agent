@@ -1,13 +1,32 @@
 from datetime import UTC, date, datetime
+from decimal import Decimal, DecimalException, localcontext
 
 import duckdb
 
 from stock_agent.domain import Bar, Market
 
+_DECIMAL_SCALE = Decimal("1E-12")
+_DECIMAL_INTEGER_LIMIT = Decimal("1E+26")
+
 
 def _require_aware(value: datetime, name: str) -> None:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
+
+
+def _require_decimal_38_12(value: Decimal, name: str) -> Decimal:
+    message = f"{name} must be exactly representable as DECIMAL(38, 12)"
+    try:
+        with localcontext() as context:
+            context.prec = max(50, len(value.as_tuple().digits) + 12)
+            if abs(value) >= _DECIMAL_INTEGER_LIMIT:
+                raise ValueError(message)
+            quantized = value.quantize(_DECIMAL_SCALE)
+            if quantized != value:
+                raise ValueError(message)
+            return quantized
+    except DecimalException as error:
+        raise ValueError(message) from error
 
 
 class PointInTimeStore:
@@ -28,7 +47,8 @@ class PointInTimeStore:
                 available_at TIMESTAMP NOT NULL,
                 ingested_at TIMESTAMP NOT NULL,
                 source VARCHAR NOT NULL,
-                source_record_id VARCHAR NOT NULL
+                source_record_id VARCHAR NOT NULL,
+                UNIQUE(source, source_record_id)
             )
             """
         )
@@ -70,24 +90,47 @@ class PointInTimeStore:
             raise ValueError("source must not be blank")
         if not source_record_id:
             raise ValueError("source_record_id must not be blank")
+        decimals = [
+            _require_decimal_38_12(value, name)
+            for name, value in (
+                ("open", bar.open),
+                ("high", bar.high),
+                ("low", bar.low),
+                ("close", bar.close),
+                ("volume", bar.volume),
+            )
+        ]
+        payload = (
+            str(bar.market),
+            bar.symbol.strip().upper(),
+            bar.session_date,
+            *decimals,
+            bar.available_at.astimezone(UTC).replace(tzinfo=None),
+            ingested_at.astimezone(UTC).replace(tzinfo=None),
+            source,
+            source_record_id,
+        )
+        existing = self._connection.execute(
+            """
+            SELECT market, symbol, session_date, open, high, low, close, volume,
+                   available_at, ingested_at, source, source_record_id
+            FROM bars
+            WHERE source = ? AND source_record_id = ?
+            """,
+            [source, source_record_id],
+        ).fetchone()
+        if existing is not None:
+            if existing == payload:
+                return
+            raise ValueError(
+                "conflicting payload for revision identity "
+                f"({source!r}, {source_record_id!r})"
+            )
         self._connection.execute(
             """
             INSERT INTO bars VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [
-                str(bar.market),
-                bar.symbol.strip().upper(),
-                bar.session_date,
-                bar.open,
-                bar.high,
-                bar.low,
-                bar.close,
-                bar.volume,
-                bar.available_at.astimezone(UTC).replace(tzinfo=None),
-                ingested_at.astimezone(UTC).replace(tzinfo=None),
-                source,
-                source_record_id,
-            ],
+            payload,
         )
 
     def latest_bar_as_of(
@@ -106,7 +149,7 @@ class PointInTimeStore:
             FROM bars
             WHERE market = ? AND symbol = ? AND session_date = ?
                 AND available_at <= ?
-            ORDER BY available_at DESC, ingested_at DESC
+            ORDER BY available_at DESC, ingested_at DESC, source DESC, source_record_id DESC
             LIMIT 1
             """,
             [
