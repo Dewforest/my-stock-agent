@@ -13,7 +13,7 @@ from pydantic import (
     model_validator,
 )
 
-from stock_agent.domain import Instrument, PortfolioSnapshot, StrategyIntent
+from stock_agent.domain import Instrument, PortfolioSnapshot, Position, StrategyIntent
 
 
 def _finite_decimal(value: object) -> Decimal:
@@ -70,6 +70,10 @@ class RiskContext(_ImmutableModel):
     def portfolio_has_exact_type(cls, value: object) -> object:
         if type(value) is not PortfolioSnapshot:
             raise ValueError("portfolio must be a PortfolioSnapshot")
+        if type(value.positions) is not tuple:
+            raise ValueError("portfolio positions must be a tuple")
+        if any(type(item) is not Position for item in value.positions):
+            raise ValueError("portfolio positions must contain Position values")
         return value
 
     @field_validator("instruments", mode="before")
@@ -104,6 +108,13 @@ class RiskDecision(_ImmutableModel):
     rule_ids: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
     risk_reduction: RiskReductionTarget | None = None
+
+    @field_validator("risk_reduction", mode="before")
+    @classmethod
+    def risk_reduction_has_exact_type(cls, value: object) -> object:
+        if value is not None and type(value) is not RiskReductionTarget:
+            raise ValueError("risk_reduction must be a RiskReductionTarget")
+        return value
 
     @field_validator("original_intent", mode="before")
     @classmethod

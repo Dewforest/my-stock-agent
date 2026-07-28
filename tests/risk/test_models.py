@@ -10,6 +10,7 @@ from stock_agent.domain import (
     Instrument,
     Market,
     PortfolioSnapshot,
+    Position,
     Side,
     StrategyIntent,
 )
@@ -90,6 +91,46 @@ def test_risk_context_rejects_portfolio_subclasses() -> None:
 
     with pytest.raises(ValidationError):
         RiskContext(**context_values(portfolio=portfolio))
+
+
+def test_risk_context_rejects_mutable_position_subclasses_nested_in_portfolio() -> None:
+    class MutablePosition(Position):
+        model_config = ConfigDict(frozen=False)
+
+    position = MutablePosition(
+        symbol="AAPL",
+        quantity=Decimal("1"),
+        average_cost=Decimal("100"),
+        market_value=Decimal("0"),
+    )
+    portfolio = PortfolioSnapshot(
+        **full_cash_portfolio().model_dump(exclude={"positions"}),
+        positions=(position,),
+    )
+
+    position.market_value = Decimal("1")
+    assert portfolio.positions[0].market_value == Decimal("1")
+    with pytest.raises(ValidationError):
+        RiskContext(**context_values(portfolio=portfolio))
+
+
+def test_risk_context_accepts_exact_frozen_positions() -> None:
+    position = Position(
+        symbol="AAPL",
+        quantity=Decimal("1"),
+        average_cost=Decimal("100"),
+        market_value=Decimal("0"),
+    )
+    portfolio = PortfolioSnapshot(
+        **full_cash_portfolio().model_dump(exclude={"positions"}),
+        positions=(position,),
+    )
+
+    context = RiskContext(**context_values(portfolio=portfolio))
+
+    assert context.portfolio.positions == (position,)
+    with pytest.raises(ValidationError):
+        context.portfolio.positions[0].market_value = Decimal("1")
 
 
 def test_risk_context_rejects_tuple_subclasses() -> None:
@@ -371,6 +412,21 @@ def test_risk_decision_defaults_to_empty_rule_reason_tuples() -> None:
     assert decision.reasons == ()
 
 
+def test_risk_decision_rejects_mutable_risk_reduction_subclasses() -> None:
+    class MutableRiskReductionTarget(RiskReductionTarget):
+        model_config = ConfigDict(frozen=False)
+
+    reduction = MutableRiskReductionTarget(
+        current_gross_exposure=Decimal("0.6"),
+        target_gross_exposure=Decimal("0.3"),
+    )
+
+    reduction.target_gross_exposure = Decimal("0.2")
+    assert reduction.target_gross_exposure == Decimal("0.2")
+    with pytest.raises(ValidationError):
+        RiskDecision(**decision_values(risk_reduction=reduction))
+
+
 def test_risk_decision_accepts_optional_reduction_target() -> None:
     reduction = RiskReductionTarget(
         current_gross_exposure=Decimal("0.6"),
@@ -378,6 +434,8 @@ def test_risk_decision_accepts_optional_reduction_target() -> None:
     )
     decision = RiskDecision(**decision_values(risk_reduction=reduction))
     assert decision.risk_reduction is reduction
+    with pytest.raises(ValidationError):
+        decision.risk_reduction.target_gross_exposure = Decimal("0.2")
 
 
 def test_risk_decision_is_frozen_and_forbids_extra_fields() -> None:
