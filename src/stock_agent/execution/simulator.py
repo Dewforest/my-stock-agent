@@ -3,8 +3,15 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Context, Decimal, DecimalException, localcontext
 
+from stock_agent.account import AcquisitionLot
 from stock_agent.domain import Bar, Market, Side
+from stock_agent.execution.cn_rules import CnSessionState
 from stock_agent.execution.models import Fill, FillStatus, OrderIntent
+from stock_agent.execution.rules import (
+    ChinaAShareRules,
+    MarketRuleSet,
+    USCashEquityRules,
+)
 from stock_agent.market import NoFutureSession, TradingCalendar
 
 _MAX_SUPPORTED_DECIMAL = Decimal("1E26")
@@ -15,6 +22,7 @@ _UNSUPPORTED_NUMERIC_REASON = "unsupported numeric range/precision"
 @dataclass(frozen=True)
 class _PendingOrder:
     intent: OrderIntent
+    effective_quantity: Decimal
     eligible_session: date
 
 
@@ -23,6 +31,7 @@ class ExecutionSimulator:
         self,
         calendars: Mapping[Market, TradingCalendar],
         transaction_cost_bps: Mapping[Market, Decimal] | None = None,
+        rule_sets: Mapping[Market, MarketRuleSet] | None = None,
     ) -> None:
         copied_calendars = dict(calendars)
         for market, calendar in copied_calendars.items():
@@ -33,6 +42,30 @@ class ExecutionSimulator:
             if market is not calendar.market:
                 raise ValueError("calendar key market must match calendar.market")
         self._calendars = copied_calendars
+
+        defaults: dict[Market, MarketRuleSet] = {}
+        for market, calendar in copied_calendars.items():
+            defaults[market] = (
+                ChinaAShareRules(calendar) if market is Market.CN else USCashEquityRules()
+            )
+        if rule_sets is not None:
+            copied_rules = dict(rule_sets)
+            for market, rule in copied_rules.items():
+                if not isinstance(market, Market):
+                    raise TypeError("rule set keys must be Market values")
+                if not isinstance(rule, MarketRuleSet):
+                    raise TypeError("rule set values must implement MarketRuleSet")
+                if market not in copied_calendars:
+                    raise ValueError("rule set market must have a configured calendar")
+                if rule.market is not market:
+                    raise ValueError("rule set key must match rule.market and calendar")
+                if (
+                    isinstance(rule, ChinaAShareRules)
+                    and rule.calendar != copied_calendars[market]
+                ):
+                    raise ValueError("China rule calendar must match configured calendar")
+            defaults.update(copied_rules)
+        self._rule_sets = defaults
 
         self._costs = {Market.CN: Decimal("12"), Market.US: Decimal("5")}
         if transaction_cost_bps is not None:
@@ -102,8 +135,38 @@ class ExecutionSimulator:
             return self._make_fill(
                 intent, FillStatus.REJECTED, reason="no future session"
             )
-        self._pending.append(_PendingOrder(intent, eligible_session))
-        return self._make_fill(intent, FillStatus.PENDING)
+        try:
+            effective_quantity = self._rule_sets[intent.market].normalize_quantity(
+                side=intent.side, quantity=intent.quantity
+            )
+        except Exception:
+            return self._make_fill(
+                intent, FillStatus.REJECTED, reason="market quantity rule rejected order"
+            )
+        if not isinstance(effective_quantity, Decimal) or not self._is_supported_decimal(
+            effective_quantity
+        ):
+            return self._make_fill(
+                intent,
+                FillStatus.REJECTED,
+                reason="market quantity rule returned an invalid quantity",
+            )
+        if effective_quantity <= 0:
+            return self._make_fill(
+                intent,
+                FillStatus.REJECTED,
+                reason="quantity is below the 100 share buy lot",
+            )
+        if effective_quantity > intent.quantity:
+            return self._make_fill(
+                intent,
+                FillStatus.REJECTED,
+                reason="market quantity rule may not increase requested quantity",
+            )
+        self._pending.append(_PendingOrder(intent, effective_quantity, eligible_session))
+        return self._make_fill(
+            intent, FillStatus.PENDING, requested_quantity=effective_quantity
+        )
 
     def process_session(
         self,
@@ -111,6 +174,8 @@ class ExecutionSimulator:
         market: Market,
         session_date: date,
         bars: Iterable[Bar],
+        session_states: Iterable[CnSessionState] = (),
+        account_lots: Mapping[str, Iterable[AcquisitionLot]] | None = None,
     ) -> tuple[Fill, ...]:
         self._require_plain_date(session_date, "session_date")
         calendar = self._calendars.get(market)
@@ -122,6 +187,8 @@ class ExecutionSimulator:
         materialized_bars = tuple(bars)
         bars_by_symbol: dict[str, Bar] = {}
         for bar in materialized_bars:
+            if not isinstance(bar, Bar):
+                raise TypeError("bars must contain only Bar values")
             if bar.market is not market:
                 raise ValueError("bar market does not match process market")
             if bar.session_date != session_date:
@@ -129,6 +196,36 @@ class ExecutionSimulator:
             if bar.symbol in bars_by_symbol:
                 raise ValueError(f"duplicate bar symbol {bar.symbol}")
             bars_by_symbol[bar.symbol] = bar
+
+        materialized_states = tuple(session_states)
+        if market is not Market.CN and materialized_states:
+            raise ValueError("session states are only valid for the China market")
+        states_by_symbol: dict[str, CnSessionState] = {}
+        for state in materialized_states:
+            if not isinstance(state, CnSessionState):
+                raise TypeError("session_states must contain only CnSessionState values")
+            if state.session_date != session_date:
+                raise ValueError("state session_date does not match process session_date")
+            if state.symbol in states_by_symbol:
+                raise ValueError(f"duplicate state symbol {state.symbol}")
+            states_by_symbol[state.symbol] = state
+
+        lots_by_account: dict[str, tuple[AcquisitionLot, ...]] = {}
+        if account_lots is not None:
+            if not isinstance(account_lots, Mapping):
+                raise TypeError("account_lots must be a mapping")
+            for account_id, lots in account_lots.items():
+                if not isinstance(account_id, str):
+                    raise TypeError("account_lots keys must be strings")
+                normalized_account_id = account_id.strip()
+                if not normalized_account_id:
+                    raise ValueError("account_lots account id must be non-blank")
+                if normalized_account_id in lots_by_account:
+                    raise ValueError("duplicate normalized account_lots account id")
+                materialized_lots = tuple(lots)
+                if any(not isinstance(lot, AcquisitionLot) for lot in materialized_lots):
+                    raise TypeError("account_lots values must contain only AcquisitionLot values")
+                lots_by_account[normalized_account_id] = materialized_lots
 
         processed_through = self._processed_through.get(market)
         if processed_through is not None and session_date < processed_through:
@@ -139,6 +236,8 @@ class ExecutionSimulator:
 
         fills: list[Fill] = []
         remaining: list[_PendingOrder] = []
+        remaining_sellable: dict[tuple[str, str], Decimal] = {}
+        rule = self._rule_sets[market]
         for pending in self._pending:
             intent = pending.intent
             bar = bars_by_symbol.get(intent.symbol)
@@ -149,11 +248,93 @@ class ExecutionSimulator:
                 remaining.append(pending)
                 continue
 
+            state = states_by_symbol.get(intent.symbol)
+            try:
+                requires_session_state = rule.requires_session_state
+                if not isinstance(requires_session_state, bool):
+                    raise TypeError
+            except Exception:
+                fills.append(
+                    self._make_fill(
+                        intent,
+                        FillStatus.REJECTED,
+                        requested_quantity=pending.effective_quantity,
+                        reason="market session-state rule rejected order",
+                    )
+                )
+                continue
+            if requires_session_state and state is None:
+                remaining.append(pending)
+                continue
+            lots = lots_by_account.get(intent.account_id, ())
+            try:
+                block_reason = rule.execution_block_reason(
+                    side=intent.side,
+                    symbol=intent.symbol,
+                    session_date=session_date,
+                    quantity=pending.effective_quantity,
+                    state=state,
+                    acquisition_lots=lots,
+                )
+                if block_reason is not None and (
+                    not isinstance(block_reason, str) or not block_reason.strip()
+                ):
+                    raise TypeError
+            except Exception:
+                fills.append(
+                    self._make_fill(
+                        intent,
+                        FillStatus.REJECTED,
+                        requested_quantity=pending.effective_quantity,
+                        reason="market execution rule rejected order",
+                    )
+                )
+                continue
+            sellable_key = (intent.account_id, intent.symbol)
+            if intent.side is Side.SELL and market is Market.CN and block_reason is None:
+                if sellable_key not in remaining_sellable:
+                    try:
+                        remaining_sellable[sellable_key] = rule.sellable_quantity(
+                            symbol=intent.symbol,
+                            session_date=session_date,
+                            acquisition_lots=lots,
+                        )
+                        sellable = remaining_sellable[sellable_key]
+                        if (
+                            not isinstance(sellable, Decimal)
+                            or not sellable.is_finite()
+                            or sellable < 0
+                        ):
+                            raise ValueError
+                    except Exception:
+                        fills.append(
+                            self._make_fill(
+                                intent,
+                                FillStatus.REJECTED,
+                                requested_quantity=pending.effective_quantity,
+                                reason="market sellable quantity rule rejected order",
+                            )
+                        )
+                        continue
+                if pending.effective_quantity > remaining_sellable[sellable_key]:
+                    block_reason = "sell quantity exceeds remaining T+1 settled quantity"
+            if block_reason is not None:
+                fills.append(
+                    self._make_fill(
+                        intent,
+                        FillStatus.REJECTED,
+                        requested_quantity=pending.effective_quantity,
+                        reason=block_reason,
+                    )
+                )
+                continue
+
             if not self._is_supported_decimal(bar.open):
                 fills.append(
                     self._make_fill(
                         intent,
                         FillStatus.REJECTED,
+                        requested_quantity=pending.effective_quantity,
                         reason=f"bar open has {_UNSUPPORTED_NUMERIC_REASON}",
                     )
                 )
@@ -161,13 +342,14 @@ class ExecutionSimulator:
 
             try:
                 fees = self._calculate_fees(
-                    intent.quantity, bar.open, self._costs[market]
+                    pending.effective_quantity, bar.open, self._costs[market]
                 )
             except DecimalException:
                 fills.append(
                     self._make_fill(
                         intent,
                         FillStatus.REJECTED,
+                        requested_quantity=pending.effective_quantity,
                         reason="fee calculation failed for unsupported numeric result",
                     )
                 )
@@ -177,12 +359,17 @@ class ExecutionSimulator:
                 self._make_fill(
                     intent,
                     FillStatus.FILLED,
-                    filled_quantity=intent.quantity,
+                    requested_quantity=pending.effective_quantity,
+                    filled_quantity=pending.effective_quantity,
                     price=bar.open,
                     fees=fees,
                     session_date=session_date,
                 )
             )
+            if intent.side is Side.SELL and market is Market.CN:
+                remaining_sellable[sellable_key] = self._subtract_quantity(
+                    remaining_sellable[sellable_key], pending.effective_quantity
+                )
         self._pending = remaining
         if processed_through is None or session_date > processed_through:
             self._processed_through[market] = session_date
@@ -214,6 +401,12 @@ class ExecutionSimulator:
             return quantity * price * bps / Decimal("10000")
 
     @staticmethod
+    def _subtract_quantity(left: Decimal, right: Decimal) -> Decimal:
+        coefficient_digits = sum(len(value.as_tuple().digits) for value in (left, right))
+        context = Context(prec=max(128, coefficient_digits + 4))
+        return context.subtract(left, right)
+
+    @staticmethod
     def _make_fill(
         intent: OrderIntent,
         status: FillStatus,
@@ -223,6 +416,7 @@ class ExecutionSimulator:
         fees: Decimal = Decimal("0"),
         session_date: date | None = None,
         reason: str | None = None,
+        requested_quantity: Decimal | None = None,
     ) -> Fill:
         return Fill(
             status=status,
@@ -231,7 +425,9 @@ class ExecutionSimulator:
             symbol=intent.symbol,
             market=intent.market,
             side=intent.side,
-            requested_quantity=intent.quantity,
+            requested_quantity=(
+                intent.quantity if requested_quantity is None else requested_quantity
+            ),
             filled_quantity=filled_quantity,
             price=price,
             fees=fees,

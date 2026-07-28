@@ -8,6 +8,7 @@ from pydantic import ValidationError
 import stock_agent.execution as execution
 from stock_agent.domain import Bar, Market, Side
 from stock_agent.execution import ExecutionSimulator, Fill, FillStatus, OrderIntent
+from stock_agent.execution.cn_rules import CnPriceLimitState, CnSessionState
 from stock_agent.market import TradingCalendar
 
 US_SESSIONS = (date(2026, 7, 24), date(2026, 7, 27), date(2026, 7, 28))
@@ -47,6 +48,15 @@ def make_bar(**overrides: object) -> Bar:
     }
     values.update(overrides)
     return Bar(**values)
+
+
+def make_cn_state(symbol: str, session_date: date) -> CnSessionState:
+    return CnSessionState(
+        symbol=symbol,
+        session_date=session_date,
+        suspended=False,
+        price_limit_state=CnPriceLimitState.NONE,
+    )
 
 
 def test_buy_fills_at_next_session_open_not_decision_session() -> None:
@@ -90,7 +100,9 @@ def test_default_transaction_costs_are_exact_for_cn_and_us() -> None:
         }
     )
     simulator.submit(
-        make_intent(order_id="cn", symbol="600519", market=Market.CN),
+        make_intent(
+            order_id="cn", symbol="600519", market=Market.CN, quantity=Decimal("100")
+        ),
         date(2026, 7, 24),
     )
     simulator.submit(make_intent(order_id="us"), date(2026, 7, 24))
@@ -106,6 +118,7 @@ def test_default_transaction_costs_are_exact_for_cn_and_us() -> None:
                 session_date=date(2026, 7, 27),
             )
         ],
+        session_states=[make_cn_state("600519", date(2026, 7, 27))],
     )[0]
     us_fill = simulator.process_session(
         market=Market.US,
@@ -113,7 +126,7 @@ def test_default_transaction_costs_are_exact_for_cn_and_us() -> None:
         bars=[make_bar()],
     )[0]
 
-    assert cn_fill.fees == Decimal("1.2")
+    assert cn_fill.fees == Decimal("12")
     assert us_fill.fees == Decimal("0.5")
     assert isinstance(cn_fill.fees, Decimal)
     assert isinstance(us_fill.fees, Decimal)
@@ -370,7 +383,9 @@ def test_processed_watermarks_are_independent_per_market() -> None:
     )
 
     cn_pending = simulator.submit(
-        make_intent(order_id="cn", symbol="600519", market=Market.CN),
+        make_intent(
+            order_id="cn", symbol="600519", market=Market.CN, quantity=Decimal("100")
+        ),
         date(2026, 7, 24),
     )
     assert cn_pending.status is FillStatus.PENDING
@@ -391,7 +406,9 @@ def test_processing_is_market_isolated_ordered_and_idempotent() -> None:
     )
     simulator.submit(make_intent(order_id="us-1", symbol="AAPL"), date(2026, 7, 24))
     simulator.submit(
-        make_intent(order_id="cn-1", symbol="600519", market=Market.CN),
+        make_intent(
+            order_id="cn-1", symbol="600519", market=Market.CN, quantity=Decimal("100")
+        ),
         date(2026, 7, 24),
     )
     simulator.submit(make_intent(order_id="us-2", symbol="MSFT"), date(2026, 7, 24))
@@ -846,7 +863,15 @@ def test_pending_order_ids_is_read_only() -> None:
 
 
 def test_execution_public_api_exports_only_requested_types() -> None:
-    expected = {"FillStatus", "OrderIntent", "Fill", "ExecutionSimulator"}
+    expected = {
+        "ChinaAShareRules",
+        "ExecutionSimulator",
+        "Fill",
+        "FillStatus",
+        "MarketRuleSet",
+        "OrderIntent",
+        "USCashEquityRules",
+    }
     assert set(execution.__all__) == expected
     assert {name for name in expected if hasattr(execution, name)} == expected
     assert list(FillStatus) == [
