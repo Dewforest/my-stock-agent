@@ -1,5 +1,6 @@
 from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -76,6 +77,103 @@ def state(ledger: PortfolioLedger) -> tuple[object, ...]:
         ledger.realized_pnl,
         ledger.snapshot(),
     )
+
+
+def test_append_rejects_earlier_fold_instant_atomically() -> None:
+    new_york = ZoneInfo("America/New_York")
+    ledger = PortfolioLedger("account-1", Market.US)
+    ledger.append(
+        event(
+            CashInitialized,
+            "init",
+            0,
+            occurred_at=datetime(2026, 11, 1, 0, 30, tzinfo=new_york),
+            amount=Decimal("1000"),
+        )
+    )
+    ledger.append(
+        event(
+            CashAdjusted,
+            "later",
+            1,
+            occurred_at=datetime(2026, 11, 1, 1, 15, tzinfo=new_york, fold=1),
+            amount=Decimal("50"),
+            reason="later instant",
+        )
+    )
+    before = state(ledger)
+    earlier = event(
+        CashAdjusted,
+        "earlier",
+        2,
+        occurred_at=datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=0),
+        amount=Decimal("25"),
+        reason="earlier instant",
+    )
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        ledger.append(earlier)
+
+    assert state(ledger) == before
+
+
+def test_historical_snapshot_excludes_future_fold_instant() -> None:
+    new_york = ZoneInfo("America/New_York")
+    ledger = PortfolioLedger("account-1", Market.US)
+    ledger.append(
+        event(
+            CashInitialized,
+            "init",
+            0,
+            occurred_at=datetime(2026, 11, 1, 0, 30, tzinfo=new_york),
+            amount=Decimal("1000"),
+        )
+    )
+    ledger.append(
+        event(
+            CashAdjusted,
+            "adjust",
+            1,
+            occurred_at=datetime(2026, 11, 1, 1, 15, tzinfo=new_york, fold=1),
+            amount=Decimal("50"),
+            reason="future adjustment",
+        )
+    )
+    as_of = datetime(2026, 11, 1, 1, 30, tzinfo=new_york, fold=0)
+
+    snapshot = ledger.snapshot(as_of)
+
+    assert snapshot.cash == Decimal("1000")
+    assert snapshot.as_of == as_of
+    assert snapshot.as_of.fold == 0
+
+
+def test_append_rejects_equal_instant_with_different_offset_atomically() -> None:
+    ledger = ledger_with_cash()
+    first = event(
+        CashAdjusted,
+        "first",
+        1,
+        amount=Decimal("50"),
+        reason="first adjustment",
+    )
+    ledger.append(first)
+    before = state(ledger)
+    equivalent = first.occurred_at.astimezone(timezone(timedelta(hours=-4)))
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        ledger.append(
+            event(
+                CashAdjusted,
+                "equivalent",
+                2,
+                occurred_at=equivalent,
+                amount=Decimal("25"),
+                reason="same instant",
+            )
+        )
+
+    assert state(ledger) == before
 
 
 def test_reverse_mark_restores_the_fill_mark_and_restates_peak() -> None:

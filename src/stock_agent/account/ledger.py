@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import (
     ROUND_HALF_EVEN,
     Context,
@@ -29,6 +29,10 @@ NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length
 Symbol = Annotated[
     str, StringConstraints(strip_whitespace=True, to_upper=True, min_length=1)
 ]
+
+
+def _utc_instant(value: datetime) -> datetime:
+    return value.astimezone(UTC)
 
 
 def _validate_decimal(value: object) -> Decimal:
@@ -214,7 +218,12 @@ class PortfolioLedger:
         if as_of.tzinfo is None or as_of.utcoffset() is None:
             raise ValueError("as_of must be timezone-aware")
 
-        prefix = tuple(event for event in self._events if event.occurred_at <= as_of)
+        as_of_instant = _utc_instant(as_of)
+        prefix = tuple(
+            event
+            for event in self._events
+            if _utc_instant(event.occurred_at) <= as_of_instant
+        )
         if not prefix:
             raise RuntimeError("cash has not been initialized")
         try:
@@ -235,7 +244,9 @@ class PortfolioLedger:
             raise ValueError("the first event must be CashInitialized")
         if any(existing.event_id == event.event_id for existing in self._events):
             raise ValueError("event_id must be unique")
-        if self._events and event.occurred_at <= self._events[-1].occurred_at:
+        if self._events and _utc_instant(event.occurred_at) <= _utc_instant(
+            self._events[-1].occurred_at
+        ):
             raise ValueError("occurred_at must be strictly increasing")
         if isinstance(event, CashInitialized) and self._events:
             raise ValueError("CashInitialized can only occur once")
