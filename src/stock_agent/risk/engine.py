@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 from decimal import (
     MAX_EMAX,
+    MAX_PREC,
     MIN_EMIN,
     ROUND_HALF_EVEN,
     Clamped,
@@ -37,26 +38,27 @@ _ZERO_NAV_BUY_BLOCK = "ZERO_NAV_BUY_BLOCK"
 _DRAWDOWN_BUY_BLOCK_15 = "DRAWDOWN_BUY_BLOCK_15"
 _DRAWDOWN_RISK_REDUCTION_20 = "DRAWDOWN_RISK_REDUCTION_20"
 _TWO = Decimal(2)
-_FIFTEEN_PERCENT_LOSS_MULTIPLIER = Decimal(20)
-_FIFTEEN_PERCENT_PEAK_MULTIPLIER = Decimal(3)
-_TWENTY_PERCENT_LOSS_MULTIPLIER = Decimal(5)
+_FIFTEEN_PERCENT_LOSS_FACTOR = 20
+_FIFTEEN_PERCENT_PEAK_FACTOR = 3
+_TWENTY_PERCENT_LOSS_FACTOR = 5
 
 
 def _arithmetic_context_for(*values: Decimal) -> Context:
     if any(not value.is_finite() for value in values):
         raise ValueError("arithmetic values must be finite")
     tuples = [value.as_tuple() for value in values]
-    exponents: list[int] = []
-    for value_tuple in tuples:
+    nonzero_exponents: list[int] = []
+    for value, value_tuple in zip(values, tuples, strict=True):
         if not isinstance(value_tuple.exponent, int):
             raise ValueError("arithmetic values must be finite")
-        exponents.append(value_tuple.exponent)
-    highest_adjusted = max((value.adjusted() for value in values), default=0)
-    lowest_exponent = min(exponents, default=0)
+        if value:
+            nonzero_exponents.append(value_tuple.exponent)
+    highest_adjusted = max((value.adjusted() for value in values if value), default=0)
+    lowest_exponent = min(nonzero_exponents, default=0)
     span = highest_adjusted - lowest_exponent + 1
     coefficient_digits = sum(max(1, len(value_tuple.digits)) for value_tuple in tuples)
     context = Context(
-        prec=max(128, span + 32, coefficient_digits + 32),
+        prec=min(MAX_PREC, max(128, span + 32, coefficient_digits + 32)),
         rounding=ROUND_HALF_EVEN,
         Emin=MIN_EMIN,
         Emax=MAX_EMAX,
@@ -70,23 +72,49 @@ def _arithmetic_context_for(*values: Decimal) -> Context:
     return context
 
 
+def _compare_scaled_decimals(
+    left: Decimal, left_factor: int, right: Decimal, right_factor: int
+) -> int:
+    if left < 0 or right < 0 or left_factor < 0 or right_factor < 0:
+        raise ValueError("scaled comparison values must be nonnegative")
+
+    left_tuple = left.as_tuple()
+    right_tuple = right.as_tuple()
+    if not isinstance(left_tuple.exponent, int) or not isinstance(right_tuple.exponent, int):
+        raise ValueError("scaled comparison values must be finite")
+
+    left_coefficient = int("".join(map(str, left_tuple.digits))) * left_factor
+    right_coefficient = int("".join(map(str, right_tuple.digits))) * right_factor
+    if left_coefficient == 0 or right_coefficient == 0:
+        return (left_coefficient > right_coefficient) - (
+            left_coefficient < right_coefficient
+        )
+
+    left_adjusted = left_tuple.exponent + len(str(left_coefficient)) - 1
+    right_adjusted = right_tuple.exponent + len(str(right_coefficient)) - 1
+    if left_adjusted != right_adjusted:
+        return (left_adjusted > right_adjusted) - (left_adjusted < right_adjusted)
+
+    common_exponent = min(left_tuple.exponent, right_tuple.exponent)
+    left_integer = left_coefficient * 10 ** (left_tuple.exponent - common_exponent)
+    right_integer = right_coefficient * 10 ** (right_tuple.exponent - common_exponent)
+    return (left_integer > right_integer) - (left_integer < right_integer)
+
+
 def _drawdown_thresholds(peak_nav: Decimal, nav: Decimal) -> tuple[bool, bool]:
     if peak_nav == 0:
         return False, False
-    arithmetic = _arithmetic_context_for(
-        peak_nav,
-        nav,
-        _FIFTEEN_PERCENT_LOSS_MULTIPLIER,
-        _FIFTEEN_PERCENT_PEAK_MULTIPLIER,
-        _TWENTY_PERCENT_LOSS_MULTIPLIER,
-    )
+    arithmetic = _arithmetic_context_for(peak_nav, nav)
     loss = arithmetic.subtract(peak_nav, nav)
-    at_fifteen_percent = arithmetic.multiply(
-        loss, _FIFTEEN_PERCENT_LOSS_MULTIPLIER
-    ) >= arithmetic.multiply(peak_nav, _FIFTEEN_PERCENT_PEAK_MULTIPLIER)
-    at_twenty_percent = arithmetic.multiply(
-        loss, _TWENTY_PERCENT_LOSS_MULTIPLIER
-    ) >= peak_nav
+    at_fifteen_percent = (
+        _compare_scaled_decimals(
+            loss, _FIFTEEN_PERCENT_LOSS_FACTOR, peak_nav, _FIFTEEN_PERCENT_PEAK_FACTOR
+        )
+        >= 0
+    )
+    at_twenty_percent = (
+        _compare_scaled_decimals(loss, _TWENTY_PERCENT_LOSS_FACTOR, peak_nav, 1) >= 0
+    )
     return at_fifteen_percent, at_twenty_percent
 
 

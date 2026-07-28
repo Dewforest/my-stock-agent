@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from decimal import ROUND_UP, Decimal, Inexact, localcontext
+from decimal import MAX_EMAX, ROUND_UP, Decimal, Inexact, localcontext
 
 import pytest
 from pydantic import ConfigDict
@@ -154,6 +154,36 @@ def test_buy_one_e_minus_200_below_fifteen_percent_drawdown_is_approved() -> Non
     assert decision.approved_target_weight is original.target_weight
     assert decision.rule_ids == ()
     assert decision.reasons == ()
+
+
+def test_buy_with_max_emax_nav_and_zero_drawdown_is_approved() -> None:
+    maximum_nav = f"1E+{MAX_EMAX}"
+    with localcontext() as construction_context:
+        construction_context.Emax = MAX_EMAX
+        snapshot = portfolio(cash=maximum_nav, nav=maximum_nav, peak_nav=maximum_nav)
+
+    decision = RiskEngine().evaluate(intent(), context(snapshot))
+
+    assert decision.status is RiskDecisionStatus.APPROVED
+    assert decision.rule_ids == ()
+    assert decision.risk_reduction is None
+
+
+def test_max_emax_twenty_percent_drawdown_with_full_cash_has_zero_gross() -> None:
+    shared_exponent = MAX_EMAX - 1
+    peak_nav = f"10E+{shared_exponent}"
+    nav = f"8E+{shared_exponent}"
+    with localcontext() as construction_context:
+        construction_context.Emax = MAX_EMAX
+        snapshot = portfolio(cash=nav, nav=nav, peak_nav=peak_nav)
+
+    decision = RiskEngine().evaluate(intent(Side.HOLD, target_weight="0"), context(snapshot))
+
+    assert decision.status is RiskDecisionStatus.APPROVED
+    assert decision.rule_ids == ("DRAWDOWN_RISK_REDUCTION_20",)
+    assert decision.risk_reduction is not None
+    assert decision.risk_reduction.current_gross_exposure == Decimal(0)
+    assert decision.risk_reduction.target_gross_exposure == Decimal(0)
 
 
 def test_sell_at_fifteen_percent_drawdown_remains_permitted() -> None:
