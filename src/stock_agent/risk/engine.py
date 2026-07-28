@@ -4,6 +4,7 @@ from decimal import (
     MAX_PREC,
     MIN_EMIN,
     ROUND_CEILING,
+    ROUND_FLOOR,
     ROUND_HALF_EVEN,
     Clamped,
     Context,
@@ -42,10 +43,12 @@ _MISSING_INSTRUMENT_METADATA = "MISSING_INSTRUMENT_METADATA"
 _HOLDING_COUNT_MAX_10 = "HOLDING_COUNT_MAX_10"
 _SINGLE_STOCK_MAX_15 = "SINGLE_STOCK_MAX_15"
 _SECTOR_EXPOSURE_MAX_30 = "SECTOR_EXPOSURE_MAX_30"
+_DAILY_NEW_POSITION_CASH_MAX_30 = "DAILY_NEW_POSITION_CASH_MAX_30"
 _ZERO_TARGET_BUY_BLOCK = "ZERO_TARGET_BUY_BLOCK"
 _TWO = Decimal(2)
 _SINGLE_STOCK_LIMIT = Decimal("0.15")
 _SECTOR_EXPOSURE_LIMIT = Decimal("0.30")
+_DAILY_NEW_POSITION_CASH_LIMIT = Decimal("0.30")
 _FIFTEEN_PERCENT_LOSS_FACTOR = 20
 _FIFTEEN_PERCENT_PEAK_FACTOR = 3
 _TWENTY_PERCENT_LOSS_FACTOR = 5
@@ -134,6 +137,26 @@ def _gross_exposure(nav: Decimal, cash: Decimal) -> Decimal:
     if nav == 0:
         return Decimal(0)
     return arithmetic.divide(invested, nav)
+
+
+def _ratio_rounded_down(numerator: Decimal, denominator: Decimal) -> Decimal:
+    if numerator <= 0:
+        return Decimal(0)
+    numerator_tuple = numerator.as_tuple()
+    denominator_tuple = denominator.as_tuple()
+    arithmetic = Context(
+        prec=max(128, len(numerator_tuple.digits) + len(denominator_tuple.digits) + 32),
+        rounding=ROUND_FLOOR,
+        Emin=MIN_EMIN,
+        Emax=MAX_EMAX,
+        capitals=1,
+        clamp=0,
+        flags=[],
+        traps=[InvalidOperation, DivisionByZero, Overflow],
+    )
+    for signal in (Clamped, FloatOperation, Inexact, Rounded, Subnormal, Underflow):
+        arithmetic.traps[signal] = False
+    return arithmetic.divide(numerator, denominator)
 
 
 def _sector_room(
@@ -343,6 +366,28 @@ def _evaluate_buy_exposure(intent: StrategyIntent, context: RiskContext) -> Risk
         approved_target = max(Decimal(0), sector_room)
         rule_ids.append(_SECTOR_EXPOSURE_MAX_30)
         reasons.append("buy target exceeds sector exposure maximum of thirty percent")
+
+    if intent.symbol not in position_symbols:
+        budget_context = _arithmetic_context_for(context.day_start_available_cash)
+        daily_budget = budget_context.multiply(
+            context.day_start_available_cash, _DAILY_NEW_POSITION_CASH_LIMIT
+        )
+        amount_context = _arithmetic_context_for(
+            daily_budget, context.new_position_notional_committed_today
+        )
+        remaining = max(
+            Decimal(0),
+            amount_context.subtract(
+                daily_budget, context.new_position_notional_committed_today
+            ),
+        )
+        daily_target_cap = _ratio_rounded_down(remaining, portfolio.nav)
+        if daily_target_cap < approved_target:
+            approved_target = daily_target_cap
+            rule_ids.append(_DAILY_NEW_POSITION_CASH_MAX_30)
+            reasons.append(
+                "buy target exceeds remaining daily new-position cash budget of thirty percent"
+            )
 
     if approved_target == 0:
         if not rule_ids:

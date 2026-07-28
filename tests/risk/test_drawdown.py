@@ -43,11 +43,15 @@ def portfolio(
     )
 
 
-def context(snapshot: PortfolioSnapshot | None = None) -> RiskContext:
+def context(
+    snapshot: PortfolioSnapshot | None = None,
+    *,
+    day_start_available_cash: Decimal = Decimal("1000"),
+) -> RiskContext:
     return RiskContext(
         portfolio=snapshot or portfolio(),
         instruments=(AAPL,),
-        day_start_available_cash=Decimal("1000"),
+        day_start_available_cash=day_start_available_cash,
         new_position_notional_committed_today=Decimal("0"),
     )
 
@@ -176,7 +180,10 @@ def test_buy_with_max_emax_nav_and_zero_drawdown_is_approved() -> None:
         construction_context.Emax = MAX_EMAX
         snapshot = portfolio(cash=maximum_nav, nav=maximum_nav, peak_nav=maximum_nav)
 
-    decision = RiskEngine().evaluate(intent(target_weight="0.10"), context(snapshot))
+    decision = RiskEngine().evaluate(
+        intent(target_weight="0.10"),
+        context(snapshot, day_start_available_cash=Decimal(maximum_nav)),
+    )
 
     assert decision.status is RiskDecisionStatus.APPROVED
     assert decision.rule_ids == ()

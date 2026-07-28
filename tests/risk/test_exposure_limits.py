@@ -52,11 +52,12 @@ def context(
     *,
     snapshot: PortfolioSnapshot | None = None,
     instruments: tuple[Instrument, ...] | None = None,
+    day_start_available_cash: Decimal = Decimal("1000"),
 ) -> RiskContext:
     return RiskContext(
         portfolio=snapshot or portfolio(),
         instruments=(instrument("AAPL"),) if instruments is None else instruments,
-        day_start_available_cash=Decimal("1000"),
+        day_start_available_cash=day_start_available_cash,
         new_position_notional_committed_today=Decimal("0"),
     )
 
@@ -364,6 +365,7 @@ def test_max_emax_same_sector_portfolio_clamps_to_remaining_room() -> None:
     risk_context = context(
         snapshot=snapshot,
         instruments=(instrument("AAPL"), instrument("MSFT")),
+        day_start_available_cash=snapshot.nav,
     )
 
     decision = RiskEngine().evaluate(buy_intent(target="0.15"), risk_context)
