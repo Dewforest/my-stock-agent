@@ -37,7 +37,14 @@ _MARKET_MISMATCH = "MARKET_MISMATCH"
 _ZERO_NAV_BUY_BLOCK = "ZERO_NAV_BUY_BLOCK"
 _DRAWDOWN_BUY_BLOCK_15 = "DRAWDOWN_BUY_BLOCK_15"
 _DRAWDOWN_RISK_REDUCTION_20 = "DRAWDOWN_RISK_REDUCTION_20"
+_MISSING_INSTRUMENT_METADATA = "MISSING_INSTRUMENT_METADATA"
+_HOLDING_COUNT_MAX_10 = "HOLDING_COUNT_MAX_10"
+_SINGLE_STOCK_MAX_15 = "SINGLE_STOCK_MAX_15"
+_SECTOR_EXPOSURE_MAX_30 = "SECTOR_EXPOSURE_MAX_30"
+_ZERO_TARGET_BUY_BLOCK = "ZERO_TARGET_BUY_BLOCK"
 _TWO = Decimal(2)
+_SINGLE_STOCK_LIMIT = Decimal("0.15")
+_SECTOR_EXPOSURE_LIMIT = Decimal("0.30")
 _FIFTEEN_PERCENT_LOSS_FACTOR = 20
 _FIFTEEN_PERCENT_PEAK_FACTOR = 3
 _TWENTY_PERCENT_LOSS_FACTOR = 5
@@ -126,6 +133,32 @@ def _gross_exposure(nav: Decimal, cash: Decimal) -> Decimal:
     if nav == 0:
         return Decimal(0)
     return arithmetic.divide(invested, nav)
+
+
+def _sector_room(
+    intent: StrategyIntent,
+    portfolio: PortfolioSnapshot,
+    instruments_by_symbol: Mapping[str, Instrument],
+) -> Decimal:
+    intent_sector = instruments_by_symbol[intent.symbol].sector.strip().casefold()
+    same_sector_values = tuple(
+        position.market_value
+        for position in portfolio.positions
+        if position.symbol != intent.symbol
+        and instruments_by_symbol[position.symbol].sector.strip().casefold() == intent_sector
+    )
+    if not same_sector_values:
+        return _SECTOR_EXPOSURE_LIMIT
+    arithmetic = _arithmetic_context_for(
+        portfolio.nav,
+        _SECTOR_EXPOSURE_LIMIT,
+        *same_sector_values,
+    )
+    same_sector_value = Decimal(0)
+    for market_value in same_sector_values:
+        same_sector_value = arithmetic.add(same_sector_value, market_value)
+    other_sector_weight = arithmetic.divide(same_sector_value, portfolio.nav)
+    return arithmetic.subtract(_SECTOR_EXPOSURE_LIMIT, other_sector_weight)
 
 
 def _finite_decimal(value: object) -> Decimal:
@@ -269,6 +302,67 @@ class RiskDecision(_ImmutableModel):
         return self
 
 
+def _evaluate_buy_exposure(intent: StrategyIntent, context: RiskContext) -> RiskDecision:
+    portfolio = context.portfolio
+    instruments_by_symbol = {
+        instrument.symbol: instrument for instrument in context.instruments
+    }
+    required_symbols = {intent.symbol, *(position.symbol for position in portfolio.positions)}
+    missing_symbols = sorted(required_symbols - instruments_by_symbol.keys())
+    if missing_symbols:
+        return RiskDecision(
+            original_intent=intent,
+            status=RiskDecisionStatus.REJECTED,
+            approved_target_weight=None,
+            rule_ids=(_MISSING_INSTRUMENT_METADATA,),
+            reasons=(f"missing instrument metadata for symbols: {', '.join(missing_symbols)}",),
+        )
+
+    position_symbols = {position.symbol for position in portfolio.positions}
+    if intent.symbol not in position_symbols and len(position_symbols) >= 10:
+        return RiskDecision(
+            original_intent=intent,
+            status=RiskDecisionStatus.REJECTED,
+            approved_target_weight=None,
+            rule_ids=(_HOLDING_COUNT_MAX_10,),
+            reasons=("buy would exceed maximum holding count of ten",),
+        )
+
+    approved_target = intent.target_weight
+    rule_ids: list[str] = []
+    reasons: list[str] = []
+    if approved_target > _SINGLE_STOCK_LIMIT:
+        approved_target = _SINGLE_STOCK_LIMIT
+        rule_ids.append(_SINGLE_STOCK_MAX_15)
+        reasons.append("buy target exceeds single-stock maximum of fifteen percent")
+
+    sector_room = _sector_room(intent, portfolio, instruments_by_symbol)
+    if sector_room < approved_target:
+        approved_target = max(Decimal(0), sector_room)
+        rule_ids.append(_SECTOR_EXPOSURE_MAX_30)
+        reasons.append("buy target exceeds sector exposure maximum of thirty percent")
+
+    if approved_target == 0:
+        if not rule_ids:
+            rule_ids.append(_ZERO_TARGET_BUY_BLOCK)
+            reasons.append("buy target must be greater than zero")
+        return RiskDecision(
+            original_intent=intent,
+            status=RiskDecisionStatus.REJECTED,
+            approved_target_weight=None,
+            rule_ids=tuple(rule_ids),
+            reasons=tuple(reasons),
+        )
+
+    return RiskDecision(
+        original_intent=intent,
+        status=RiskDecisionStatus.CLAMPED if rule_ids else RiskDecisionStatus.APPROVED,
+        approved_target_weight=approved_target,
+        rule_ids=tuple(rule_ids),
+        reasons=tuple(reasons),
+    )
+
+
 class RiskEngine:
     __slots__ = ()
 
@@ -330,6 +424,11 @@ class RiskEngine:
                 rule_ids=(_ZERO_NAV_BUY_BLOCK,),
                 reasons=("buy blocked because portfolio NAV is zero",),
             )
+        if intent.side is Side.BUY:
+            try:
+                return _evaluate_buy_exposure(intent, context)
+            except (DecimalException, ValidationError) as error:
+                raise ValueError("risk arithmetic failed") from error
         return RiskDecision(
             original_intent=intent,
             status=RiskDecisionStatus.APPROVED,

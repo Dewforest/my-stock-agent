@@ -4,10 +4,24 @@ from decimal import MAX_EMAX, ROUND_UP, Decimal, Inexact, localcontext
 import pytest
 from pydantic import ConfigDict
 
-from stock_agent.domain import Market, PortfolioSnapshot, Position, Side, StrategyIntent
+from stock_agent.domain import (
+    Currency,
+    Instrument,
+    Market,
+    PortfolioSnapshot,
+    Position,
+    Side,
+    StrategyIntent,
+)
 from stock_agent.risk import RiskContext, RiskDecisionStatus, RiskEngine
 
 AS_OF = datetime(2026, 7, 28, 12, tzinfo=UTC)
+AAPL = Instrument(
+    symbol="AAPL",
+    market=Market.US,
+    currency=Currency.USD,
+    sector="Technology",
+)
 
 
 def portfolio(
@@ -32,7 +46,7 @@ def portfolio(
 def context(snapshot: PortfolioSnapshot | None = None) -> RiskContext:
     return RiskContext(
         portfolio=snapshot or portfolio(),
-        instruments=(),
+        instruments=(AAPL,),
         day_start_available_cash=Decimal("1000"),
         new_position_notional_committed_today=Decimal("0"),
     )
@@ -129,7 +143,7 @@ def test_buy_at_exactly_fifteen_percent_drawdown_is_rejected() -> None:
 
 
 def test_buy_below_fifteen_percent_drawdown_is_approved() -> None:
-    original = intent(target_weight="0.375")
+    original = intent(target_weight="0.10")
     decision = RiskEngine().evaluate(
         original,
         context(portfolio(cash="850.01", nav="850.01", peak_nav="1000")),
@@ -142,7 +156,7 @@ def test_buy_below_fifteen_percent_drawdown_is_approved() -> None:
 
 
 def test_buy_one_e_minus_200_below_fifteen_percent_drawdown_is_approved() -> None:
-    original = intent(target_weight="0.375")
+    original = intent(target_weight="0.10")
     nav = "0.85" + "0" * 199 + "1"
     with localcontext() as construction_context:
         construction_context.prec = 256
@@ -162,7 +176,7 @@ def test_buy_with_max_emax_nav_and_zero_drawdown_is_approved() -> None:
         construction_context.Emax = MAX_EMAX
         snapshot = portfolio(cash=maximum_nav, nav=maximum_nav, peak_nav=maximum_nav)
 
-    decision = RiskEngine().evaluate(intent(), context(snapshot))
+    decision = RiskEngine().evaluate(intent(target_weight="0.10"), context(snapshot))
 
     assert decision.status is RiskDecisionStatus.APPROVED
     assert decision.rule_ids == ()
