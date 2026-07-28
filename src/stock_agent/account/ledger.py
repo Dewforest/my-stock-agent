@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import (
     ROUND_HALF_EVEN,
     Context,
@@ -204,10 +204,24 @@ class PortfolioLedger:
             raise RuntimeError("cash has not been initialized")
         return self._positions
 
-    def snapshot(self) -> PortfolioSnapshot:
-        if self._snapshot is None:
+    def snapshot(self, as_of: datetime | None = None) -> PortfolioSnapshot:
+        if as_of is None:
+            if self._snapshot is None:
+                raise RuntimeError("cash has not been initialized")
+            return self._snapshot
+        if not isinstance(as_of, datetime):
+            raise TypeError("as_of must be a datetime")
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise ValueError("as_of must be timezone-aware")
+
+        prefix = tuple(event for event in self._events if event.occurred_at <= as_of)
+        if not prefix:
             raise RuntimeError("cash has not been initialized")
-        return self._snapshot
+        try:
+            active_events = self._active_events(prefix)
+            return self._replay(active_events, snapshot_as_of=as_of)[3]
+        except DecimalException as error:
+            raise ValueError("decimal arithmetic failed") from error
 
     def append(self, event: LedgerEvent) -> None:
         if not isinstance(
@@ -217,8 +231,6 @@ class PortfolioLedger:
             raise TypeError("event must be a LedgerEvent")
         if event.account_id != self._account_id or event.market is not self._market:
             raise ValueError("event account and market must match the ledger")
-        if isinstance(event, EventReversed):
-            raise ValueError("reversal support not yet; applied separately in B2")
         if not self._events and not isinstance(event, CashInitialized):
             raise ValueError("the first event must be CashInitialized")
         if any(existing.event_id == event.event_id for existing in self._events):
@@ -230,7 +242,10 @@ class PortfolioLedger:
 
         candidate = (*self._events, event)
         try:
-            cash, realized_pnl, positions, snapshot = self._replay(candidate)
+            active_events = self._active_events(candidate)
+            cash, realized_pnl, positions, snapshot = self._replay(
+                active_events, snapshot_as_of=event.occurred_at
+            )
         except DecimalException as error:
             raise ValueError("decimal arithmetic failed") from error
 
@@ -241,7 +256,10 @@ class PortfolioLedger:
         self._snapshot = snapshot
 
     def _replay(
-        self, events: tuple[LedgerEvent, ...]
+        self,
+        events: tuple[LedgerEvent, ...],
+        *,
+        snapshot_as_of: datetime,
     ) -> tuple[Decimal, Decimal, tuple[Position, ...], PortfolioSnapshot]:
         context = _ARITHMETIC_CONTEXT.copy()
         cash: Decimal | None = None
@@ -339,11 +357,33 @@ class PortfolioLedger:
                     nav=nav,
                     peak_nav=peak_nav,
                     positions=positions,
-                    as_of=replayed.occurred_at,
+                    as_of=snapshot_as_of if replayed is events[-1] else replayed.occurred_at,
                 )
 
         assert cash is not None and snapshot is not None
         return cash, realized_pnl, positions, snapshot
+
+    @staticmethod
+    def _active_events(events: tuple[LedgerEvent, ...]) -> tuple[LedgerEvent, ...]:
+        by_id: dict[str, LedgerEvent] = {}
+        reversed_ids: set[str] = set()
+        ordinary: list[LedgerEvent] = []
+        for event in events:
+            if isinstance(event, EventReversed):
+                target = by_id.get(event.target_event_id)
+                if target is None:
+                    raise ValueError("reversal target must be an earlier event")
+                if isinstance(target, CashInitialized):
+                    raise ValueError("CashInitialized cannot be reversed")
+                if isinstance(target, EventReversed):
+                    raise ValueError("EventReversed cannot be reversed")
+                if event.target_event_id in reversed_ids:
+                    raise ValueError("an event can only be reversed once")
+                reversed_ids.add(event.target_event_id)
+            else:
+                ordinary.append(event)
+            by_id[event.event_id] = event
+        return tuple(event for event in ordinary if event.event_id not in reversed_ids)
 
     @staticmethod
     def _require_finite(*values: Decimal) -> None:

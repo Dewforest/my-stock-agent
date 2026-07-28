@@ -293,22 +293,31 @@ def test_append_contract_failures_are_atomic_and_compare_instants() -> None:
         assert ledger_state(ledger) == before
 
 
-def test_reversal_is_explicitly_deferred_and_atomic() -> None:
+def test_cash_adjustment_can_be_reversed_without_removing_events() -> None:
     ledger = initialized_ledger()
-    before = ledger_state(ledger)
+    adjustment = CashAdjusted(
+        event_id="deposit",
+        account_id="account-1",
+        market=Market.US,
+        occurred_at=BASE_TIME + timedelta(seconds=1),
+        amount=Decimal("50"),
+        reason="deposit",
+    )
     reversal = EventReversed(
         event_id="reverse-1",
         account_id="account-1",
         market=Market.US,
-        occurred_at=BASE_TIME + timedelta(seconds=1),
-        target_event_id="init",
+        occurred_at=BASE_TIME + timedelta(seconds=2),
+        target_event_id="deposit",
         reason="correction",
     )
+    ledger.append(adjustment)
 
-    with pytest.raises(ValueError, match=r"reversal support not yet|applied separately"):
-        ledger.append(reversal)
+    ledger.append(reversal)
 
-    assert ledger_state(ledger) == before
+    assert ledger.events == (ledger.events[0], adjustment, reversal)
+    assert ledger.cash == Decimal("1000")
+    assert ledger.snapshot().as_of == reversal.occurred_at
 
 
 def test_positions_are_sorted_and_returned_objects_are_immutable() -> None:
