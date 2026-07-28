@@ -107,7 +107,7 @@ def test_other_same_sector_holdings_leave_only_ten_percent_room() -> None:
 
     assert decision.status is RiskDecisionStatus.CLAMPED
     assert decision.approved_target_weight == Decimal("0.10")
-    assert decision.rule_ids == ("SECTOR_EXPOSURE_MAX_30",)
+    assert decision.rule_ids == ("SECTOR_MAX_30",)
     assert len(decision.reasons) == 1
 
 
@@ -129,7 +129,7 @@ def test_recurring_sector_ratio_is_conservatively_clamped_below_thirty_percent()
     decision = RiskEngine().evaluate(buy_intent(target=str(old_room)), risk_context)
 
     assert decision.status is RiskDecisionStatus.CLAMPED
-    assert decision.rule_ids == ("SECTOR_EXPOSURE_MAX_30",)
+    assert decision.rule_ids == ("SECTOR_MAX_30",)
     assert decision.approved_target_weight is not None
     assert decision.approved_target_weight < old_room
     with localcontext() as exact_check:
@@ -179,7 +179,7 @@ def test_sector_comparison_uses_unicode_casefold_and_strip() -> None:
 
     assert decision.status is RiskDecisionStatus.CLAMPED
     assert decision.approved_target_weight == Decimal("0.05")
-    assert decision.rule_ids == ("SECTOR_EXPOSURE_MAX_30",)
+    assert decision.rule_ids == ("SECTOR_MAX_30",)
 
 
 def test_unrelated_sector_does_not_consume_sector_room() -> None:
@@ -206,7 +206,7 @@ def test_same_sector_at_thirty_percent_rejects_buy() -> None:
 
     assert decision.status is RiskDecisionStatus.REJECTED
     assert decision.approved_target_weight is None
-    assert decision.rule_ids == ("SECTOR_EXPOSURE_MAX_30",)
+    assert decision.rule_ids == ("SECTOR_MAX_30",)
 
 
 def test_sell_does_not_require_instrument_metadata() -> None:
@@ -257,7 +257,8 @@ def test_raw_zero_buy_target_is_rejected_without_becoming_hold() -> None:
     assert decision.approved_target_weight is None
     assert decision.original_intent is original
     assert decision.original_intent.side is Side.BUY
-    assert decision.rule_ids == ("ZERO_TARGET_BUY_BLOCK",)
+    assert decision.rule_ids == ()
+    assert decision.reasons == ()
 
 
 def test_stock_and_sector_limits_compose_in_order() -> None:
@@ -273,7 +274,7 @@ def test_stock_and_sector_limits_compose_in_order() -> None:
     assert decision.approved_target_weight == Decimal("0.10")
     assert decision.rule_ids == (
         "SINGLE_STOCK_MAX_15",
-        "SECTOR_EXPOSURE_MAX_30",
+        "SECTOR_MAX_30",
     )
     assert decision.reasons == (
         "buy target exceeds single-stock maximum of fifteen percent",
@@ -351,7 +352,7 @@ def test_fully_invested_max_emax_same_sector_portfolio_is_rejected() -> None:
 
     assert decision.status is RiskDecisionStatus.REJECTED
     assert decision.approved_target_weight is None
-    assert decision.rule_ids == ("SECTOR_EXPOSURE_MAX_30",)
+    assert decision.rule_ids == ("SECTOR_MAX_30",)
 
 
 def test_max_emax_same_sector_portfolio_clamps_to_remaining_room() -> None:
@@ -372,4 +373,4 @@ def test_max_emax_same_sector_portfolio_clamps_to_remaining_room() -> None:
 
     assert decision.status is RiskDecisionStatus.CLAMPED
     assert decision.approved_target_weight == Decimal("0.10")
-    assert decision.rule_ids == ("SECTOR_EXPOSURE_MAX_30",)
+    assert decision.rule_ids == ("SECTOR_MAX_30",)

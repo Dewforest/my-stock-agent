@@ -42,9 +42,8 @@ _DRAWDOWN_RISK_REDUCTION_20 = "DRAWDOWN_RISK_REDUCTION_20"
 _MISSING_INSTRUMENT_METADATA = "MISSING_INSTRUMENT_METADATA"
 _HOLDING_COUNT_MAX_10 = "HOLDING_COUNT_MAX_10"
 _SINGLE_STOCK_MAX_15 = "SINGLE_STOCK_MAX_15"
-_SECTOR_EXPOSURE_MAX_30 = "SECTOR_EXPOSURE_MAX_30"
+_SECTOR_MAX_30 = "SECTOR_MAX_30"
 _DAILY_NEW_POSITION_CASH_MAX_30 = "DAILY_NEW_POSITION_CASH_MAX_30"
-_ZERO_TARGET_BUY_BLOCK = "ZERO_TARGET_BUY_BLOCK"
 _TWO = Decimal(2)
 _SINGLE_STOCK_LIMIT = Decimal("0.15")
 _SECTOR_EXPOSURE_LIMIT = Decimal("0.30")
@@ -410,7 +409,7 @@ def _evaluate_buy_exposure(intent: StrategyIntent, context: RiskContext) -> Risk
     sector_room = _sector_room(intent, portfolio, instruments_by_symbol)
     if sector_room < approved_target:
         approved_target = max(Decimal(0), sector_room)
-        rule_ids.append(_SECTOR_EXPOSURE_MAX_30)
+        rule_ids.append(_SECTOR_MAX_30)
         reasons.append("buy target exceeds sector exposure maximum of thirty percent")
 
     if intent.symbol not in position_symbols:
@@ -441,9 +440,6 @@ def _evaluate_buy_exposure(intent: StrategyIntent, context: RiskContext) -> Risk
             )
 
     if approved_target == 0:
-        if not rule_ids:
-            rule_ids.append(_ZERO_TARGET_BUY_BLOCK)
-            reasons.append("buy target must be greater than zero")
         return RiskDecision(
             original_intent=intent,
             status=RiskDecisionStatus.REJECTED,

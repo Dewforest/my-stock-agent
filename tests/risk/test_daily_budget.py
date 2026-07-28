@@ -183,7 +183,7 @@ def test_stock_sector_and_daily_caps_compose_in_binding_order() -> None:
     assert decision.approved_target_weight == Decimal("0.10")
     assert decision.rule_ids == (
         "SINGLE_STOCK_MAX_15",
-        "SECTOR_EXPOSURE_MAX_30",
+        "SECTOR_MAX_30",
         DAILY_RULE,
     )
 
@@ -212,7 +212,7 @@ def test_zero_daily_cap_preserves_earlier_binding_rules_and_rejects() -> None:
     assert decision.approved_target_weight is None
     assert decision.rule_ids == (
         "SINGLE_STOCK_MAX_15",
-        "SECTOR_EXPOSURE_MAX_30",
+        "SECTOR_MAX_30",
         DAILY_RULE,
     )
 
