@@ -149,16 +149,15 @@ def _sector_room(
     )
     if not same_sector_values:
         return _SECTOR_EXPOSURE_LIMIT
-    arithmetic = _arithmetic_context_for(
-        portfolio.nav,
-        _SECTOR_EXPOSURE_LIMIT,
-        *same_sector_values,
-    )
+    arithmetic = _arithmetic_context_for(portfolio.nav, *same_sector_values)
     same_sector_value = Decimal(0)
     for market_value in same_sector_values:
         same_sector_value = arithmetic.add(same_sector_value, market_value)
     other_sector_weight = arithmetic.divide(same_sector_value, portfolio.nav)
-    return arithmetic.subtract(_SECTOR_EXPOSURE_LIMIT, other_sector_weight)
+    weight_context = _arithmetic_context_for(
+        _SECTOR_EXPOSURE_LIMIT, other_sector_weight
+    )
+    return weight_context.subtract(_SECTOR_EXPOSURE_LIMIT, other_sector_weight)
 
 
 def _finite_decimal(value: object) -> Decimal:

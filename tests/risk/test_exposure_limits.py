@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from decimal import ROUND_UP, Decimal, Inexact, localcontext
+from decimal import MAX_EMAX, ROUND_UP, Decimal, Inexact, localcontext
 
 from stock_agent.domain import (
     Currency,
@@ -306,3 +306,40 @@ def test_sector_arithmetic_is_hostile_context_safe_deterministic_and_pure() -> N
     assert first["approved_target_weight"] == "0.0999999999999999999999999999999999999999998"
     assert original.model_dump(mode="json") == intent_before
     assert risk_context.model_dump(mode="json") == context_before
+
+
+def test_fully_invested_max_emax_same_sector_portfolio_is_rejected() -> None:
+    with localcontext() as construction:
+        construction.Emax = MAX_EMAX
+        nav = f"1E+{MAX_EMAX}"
+        snapshot = portfolio((position("MSFT", nav),), nav=nav)
+    risk_context = context(
+        snapshot=snapshot,
+        instruments=(instrument("AAPL"), instrument("MSFT")),
+    )
+
+    decision = RiskEngine().evaluate(buy_intent(target="0.10"), risk_context)
+
+    assert decision.status is RiskDecisionStatus.REJECTED
+    assert decision.approved_target_weight is None
+    assert decision.rule_ids == ("SECTOR_EXPOSURE_MAX_30",)
+
+
+def test_max_emax_same_sector_portfolio_clamps_to_remaining_room() -> None:
+    with localcontext() as construction:
+        construction.Emax = MAX_EMAX
+        exponent = MAX_EMAX - 1
+        snapshot = portfolio(
+            (position("MSFT", f"2E+{exponent}"),),
+            nav=f"10E+{exponent}",
+        )
+    risk_context = context(
+        snapshot=snapshot,
+        instruments=(instrument("AAPL"), instrument("MSFT")),
+    )
+
+    decision = RiskEngine().evaluate(buy_intent(target="0.15"), risk_context)
+
+    assert decision.status is RiskDecisionStatus.CLAMPED
+    assert decision.approved_target_weight == Decimal("0.10")
+    assert decision.rule_ids == ("SECTOR_EXPOSURE_MAX_30",)
