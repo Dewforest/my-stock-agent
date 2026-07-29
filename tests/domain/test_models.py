@@ -337,6 +337,50 @@ def make_snapshot(**overrides: object) -> PortfolioSnapshot:
     return PortfolioSnapshot(**values)
 
 
+def domain_model_instances() -> tuple[
+    Bar | Instrument | Position | PortfolioSnapshot | StrategyIntent, ...
+]:
+    return (
+        make_bar(),
+        Instrument(
+            symbol="AAPL",
+            market=Market.US,
+            currency=Currency.USD,
+            sector="Technology",
+        ),
+        make_position(),
+        make_snapshot(positions=(make_position(),)),
+        make_intent(),
+    )
+
+
+@pytest.mark.parametrize("deep", [False, True])
+def test_domain_model_copies_remain_equal_and_frozen(deep: bool) -> None:
+    for model in domain_model_instances():
+        copied = model.model_copy(deep=deep)
+
+        assert copied == model
+        field = next(iter(type(copied).model_fields))
+        with pytest.raises(ValidationError):
+            setattr(copied, field, getattr(copied, field))
+
+
+def test_domain_models_allow_empty_copy_updates() -> None:
+    for model in domain_model_instances():
+        assert model.model_copy(update={}) == model
+
+
+def test_domain_models_reject_nonempty_copy_updates_without_mutating_source() -> None:
+    for model in domain_model_instances():
+        original = model.model_dump()
+        field = next(iter(type(model).model_fields))
+
+        with pytest.raises(TypeError):
+            model.model_copy(update={field: getattr(model, field)})
+
+        assert model.model_dump() == original
+
+
 @pytest.mark.parametrize(
     ("factory", "field", "decimal_value"),
     [

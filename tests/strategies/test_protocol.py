@@ -212,6 +212,11 @@ def test_market_snapshot_rejects_bar_subclasses() -> None:
         MarketSnapshot(**snapshot_values(bars=(item,)))
 
 
+def test_market_snapshot_cannot_be_built_from_copy_updated_bar() -> None:
+    with pytest.raises(TypeError):
+        MarketSnapshot(**snapshot_values(bars=(bar().model_copy(update={"volume": []}),)))
+
+
 def test_market_snapshot_is_frozen_transitively_and_forbids_extras() -> None:
     item = bar()
     snapshot = MarketSnapshot(**snapshot_values(bars=(item,)))
@@ -296,6 +301,13 @@ def test_strategy_context_rejects_portfolio_subclasses() -> None:
         StrategyContext(**context_values(portfolio=nested))
 
 
+def test_strategy_context_cannot_be_built_from_copy_updated_portfolio() -> None:
+    with pytest.raises(TypeError):
+        StrategyContext(
+            **context_values(portfolio=portfolio().model_copy(update={"account_id": []}))
+        )
+
+
 def test_strategy_context_rejects_non_tuple_positions() -> None:
     nested = portfolio()
     object.__setattr__(nested, "positions", [])
@@ -321,6 +333,15 @@ def test_strategy_context_rejects_position_subclasses() -> None:
     nested = portfolio(positions=(nested_position,))
     with pytest.raises(ValidationError):
         StrategyContext(**context_values(portfolio=nested))
+
+
+def test_strategy_context_cannot_be_built_from_copy_updated_position() -> None:
+    with pytest.raises(TypeError):
+        StrategyContext(
+            **context_values(
+                portfolio=portfolio(positions=(position().model_copy(update={"average_cost": []}),))
+            )
+        )
 
 
 def test_strategy_context_is_frozen_transitively_and_forbids_extras() -> None:

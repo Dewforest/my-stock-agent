@@ -1,7 +1,8 @@
+from collections.abc import Mapping
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Self
+from typing import Annotated, Any, Self
 
 from pydantic import (
     AwareDatetime,
@@ -24,6 +25,11 @@ PercentageInt = Annotated[int, Field(ge=0, le=100)]
 
 class _ImmutableModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        if update:
+            raise TypeError("immutable domain models do not support copy updates")
+        return super().model_copy(update=None, deep=deep)
 
 
 class Market(StrEnum):
