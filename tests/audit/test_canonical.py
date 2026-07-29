@@ -41,6 +41,13 @@ def test_canonical_decimal_collapses_zero_and_trailing_zero_equivalence() -> Non
     assert canonical_decimal(Decimal("-0.000")) == "0"
     assert canonical_decimal(Decimal("1.20")) == "12e-1"
     assert canonical_decimal(Decimal("1.2")) == "12e-1"
+    assert canonical_decimal(Decimal("-1200")) == "-12e2"
+    assert canonical_decimal(Decimal("-7E+999999999999999999")) == (
+        "-7e999999999999999999"
+    )
+    assert canonical_decimal(Decimal("3E-999999999999999999")) == (
+        "3e-999999999999999999"
+    )
 
 
 def test_canonical_decimal_isolated_from_hostile_ambient_context() -> None:
