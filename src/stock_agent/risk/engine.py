@@ -18,6 +18,7 @@ from decimal import (
     Rounded,
     Subnormal,
     Underflow,
+    localcontext,
 )
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
@@ -201,6 +202,21 @@ def _gross_exposure(nav: Decimal, cash: Decimal) -> Decimal:
     if nav == 0:
         return Decimal(0)
     return arithmetic.divide(invested, nav)
+
+
+def _risk_reduction_for(
+    portfolio: PortfolioSnapshot, *, at_twenty_percent: bool
+) -> "RiskReductionTarget | None":
+    if not at_twenty_percent:
+        return None
+    current_gross = _gross_exposure(portfolio.nav, portfolio.cash)
+    target_context = _arithmetic_context_for(current_gross, _TWO)
+    target_gross = target_context.divide(current_gross, _TWO)
+    return RiskReductionTarget(
+        current_gross_exposure=current_gross,
+        target_gross_exposure=target_gross,
+        review_required=True,
+    )
 
 
 def _ratio_rounded_down(numerator: Decimal, denominator: Decimal) -> Decimal:
@@ -498,6 +514,56 @@ def _evaluate_buy_exposure(
 class RiskEngine:
     __slots__ = ()
 
+    def assess_portfolio(self, context: RiskContext) -> RiskReductionTarget | None:
+        if type(context) is not RiskContext:
+            raise TypeError("context must be exactly RiskContext")
+        shallow = RiskContext(
+            portfolio=context.portfolio,
+            instruments=context.instruments,
+            day_start_available_cash=context.day_start_available_cash,
+            new_position_notional_committed_today=(
+                context.new_position_notional_committed_today
+            ),
+        )
+        validation_candidates = (
+            getattr(shallow.portfolio, "cash", Decimal(0)),
+            getattr(shallow.portfolio, "nav", Decimal(0)),
+            getattr(shallow.portfolio, "peak_nav", Decimal(0)),
+            shallow.day_start_available_cash,
+            shallow.new_position_notional_committed_today,
+            *(
+                getattr(position, field_name, Decimal(0))
+                for position in shallow.portfolio.positions
+                for field_name in ("quantity", "average_cost", "market_value")
+            ),
+        )
+        validation_values = tuple(
+            value
+            for value in validation_candidates
+            if type(value) is Decimal and value.is_finite()
+        )
+        with localcontext(_arithmetic_context_for(*validation_values)):
+            validated = RiskContext(
+                portfolio=PortfolioSnapshot.model_validate(shallow.portfolio),
+                instruments=tuple(
+                    Instrument.model_validate(instrument)
+                    for instrument in shallow.instruments
+                ),
+                day_start_available_cash=shallow.day_start_available_cash,
+                new_position_notional_committed_today=(
+                    shallow.new_position_notional_committed_today
+                ),
+            )
+        try:
+            _, at_twenty_percent = _drawdown_thresholds(
+                validated.portfolio.peak_nav, validated.portfolio.nav
+            )
+            return _risk_reduction_for(
+                validated.portfolio, at_twenty_percent=at_twenty_percent
+            )
+        except DecimalException as error:
+            raise ValueError("risk arithmetic failed") from error
+
     def evaluate_many(
         self, intents: tuple[StrategyIntent, ...], context: RiskContext
     ) -> tuple[RiskDecision, ...]:
@@ -573,24 +639,17 @@ class RiskEngine:
             at_fifteen_percent, at_twenty_percent = _drawdown_thresholds(
                 portfolio.peak_nav, portfolio.nav
             )
-            current_gross = _gross_exposure(portfolio.nav, portfolio.cash)
-            target_context = _arithmetic_context_for(current_gross, _TWO)
-            target_gross = target_context.divide(current_gross, _TWO)
+            reduction = _risk_reduction_for(
+                portfolio, at_twenty_percent=at_twenty_percent
+            )
+        except ValidationError as error:
+            raise ValueError("risk arithmetic failed") from error
         except DecimalException as error:
             raise ValueError("risk arithmetic failed") from error
 
         rule_ids: list[str] = []
         reasons: list[str] = []
-        reduction = None
-        if at_twenty_percent:
-            try:
-                reduction = RiskReductionTarget(
-                    current_gross_exposure=current_gross,
-                    target_gross_exposure=target_gross,
-                    review_required=True,
-                )
-            except (DecimalException, ValidationError) as error:
-                raise ValueError("risk arithmetic failed") from error
+        if reduction is not None:
             rule_ids.append(_DRAWDOWN_RISK_REDUCTION_20)
             reasons.append("drawdown of twenty percent or more requires gross exposure review")
 
