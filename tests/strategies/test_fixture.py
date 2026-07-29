@@ -4,7 +4,16 @@ import inspect
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from datetime import UTC, date, datetime, timedelta, timezone
-from decimal import Decimal, getcontext, setcontext
+from decimal import (
+    MAX_EMAX,
+    MIN_EMIN,
+    Context,
+    Decimal,
+    DecimalException,
+    getcontext,
+    localcontext,
+    setcontext,
+)
 
 import pytest
 from pydantic import ValidationError
@@ -88,6 +97,27 @@ def make_context(
     )
 
 
+def make_context_with_exact_portfolio(
+    bars: tuple[Bar, ...], *, market_value: str, cash: str, nav: str
+) -> StrategyContext:
+    with localcontext(Context(prec=max(map(len, (market_value, cash, nav))) + 2)):
+        position = make_position("AAPL", market_value)
+        portfolio = PortfolioSnapshot(
+            account_id="account-1",
+            market=Market.US,
+            cash=Decimal(cash),
+            nav=Decimal(nav),
+            peak_nav=Decimal(nav),
+            positions=(position,),
+            as_of=AS_OF,
+        )
+        return StrategyContext(
+            market_snapshot=MarketSnapshot(as_of=AS_OF, market=Market.US, bars=bars),
+            portfolio=portfolio,
+            strategy_config_version="1",
+        )
+
+
 def trend_bars(symbol: str, closes: tuple[str, ...]) -> tuple[Bar, ...]:
     return tuple(make_bar(symbol, 26 + index, close) for index, close in enumerate(closes))
 
@@ -169,7 +199,7 @@ def test_evaluate_requires_exact_revalidated_context_and_matching_config() -> No
     ("held_value", "expected_weight"),
     [
         (None, "0"),
-        ("100", "0.090909090909090909090909090909090909090909090909091"),
+        ("100", "0.090909090909090909090909090909090909090909090909090"),
     ],
 )
 def test_fewer_than_three_bars_holds_current_weight(
@@ -202,6 +232,67 @@ def test_rising_average_targets_ten_percent(
 
 
 @pytest.mark.parametrize(
+    ("market_value", "cash", "nav", "expected_side"),
+    [
+        (
+            "1" + "0" * 60,
+            "9" + "0" * 59 + "1",
+            "1" + "0" * 60 + "1",
+            Side.BUY,
+        ),
+        (
+            "1" + "0" * 59 + "1",
+            "8" + "9" * 60,
+            "1" + "0" * 61,
+            Side.REDUCE,
+        ),
+        ("1" + "0" * 60, "9" + "0" * 60, "1" + "0" * 61, Side.HOLD),
+    ],
+)
+def test_rising_direction_uses_exact_ten_percent_comparison(
+    market_value: str, cash: str, nav: str, expected_side: Side
+) -> None:
+    context = make_context_with_exact_portfolio(
+        trend_bars("AAPL", ("1", "2", "3")),
+        market_value=market_value,
+        cash=cash,
+        nav=nav,
+    )
+
+    intent = MovingAverageFixtureStrategy().evaluate(context)[0]
+
+    assert intent.side is expected_side
+    assert intent.target_weight == Decimal("0.10")
+
+
+@pytest.mark.parametrize(
+    "closes",
+    [
+        (f"1E{MIN_EMIN}", f"1E{MAX_EMAX}", f"1E{MIN_EMIN}"),
+        (f"1E{MAX_EMAX}", f"9E{MAX_EMAX}", f"9E{MAX_EMAX}"),
+    ],
+)
+def test_extreme_trend_arithmetic_has_stable_wrapped_failure(
+    closes: tuple[str, ...],
+) -> None:
+    ambient_before = decimal_context_signature()
+
+    with pytest.raises(ValueError, match=r"^fixture arithmetic failed$") as raised:
+        MovingAverageFixtureStrategy().evaluate(make_context(trend_bars("AAPL", closes)))
+
+    assert isinstance(raised.value.__cause__, DecimalException)
+    assert decimal_context_signature() == ambient_before
+
+
+def test_same_maximum_exponent_trend_is_classified_when_exactly_representable() -> None:
+    closes = tuple(f"{coefficient}E{MAX_EMAX}" for coefficient in ("1", "2", "3"))
+
+    intent = MovingAverageFixtureStrategy().evaluate(make_context(trend_bars("AAPL", closes)))[0]
+
+    assert intent.side is Side.BUY
+
+
+@pytest.mark.parametrize(
     ("position_value", "expected_side", "expected_weight"),
     [(None, Side.HOLD, "0"), ("100", Side.SELL, "0")],
 )
@@ -219,7 +310,7 @@ def test_equal_averages_hold_current_weight() -> None:
 
     assert intent.side is Side.HOLD
     assert intent.target_weight == Decimal(
-        "0.090909090909090909090909090909090909090909090909091"
+        "0.090909090909090909090909090909090909090909090909090"
     )
 
 
