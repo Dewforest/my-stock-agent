@@ -458,8 +458,8 @@ class SessionResult(_ImmutableBacktestModel):
         close_instant = self.market_snapshot.as_of.astimezone(UTC)
         if tuple(item.bar for item in self.selected_revisions) != self.market_snapshot.bars:
             raise ValueError("selected revision bars must exactly match the close market bars")
-        if any(item.session_date != self.session_date for item in self.market_snapshot.bars):
-            raise ValueError("close market bars must match the session date")
+        if any(item.session_date > self.session_date for item in self.market_snapshot.bars):
+            raise ValueError("close market bars cannot be from a future session")
         if any(item.market is not market for item in self.intents):
             raise ValueError("intent markets must match the close market")
         if any(
@@ -658,6 +658,17 @@ class BacktestResult(_ImmutableBacktestModel):
         result_dates = tuple(item.session_date for item in self.sessions)
         if result_dates != self.manifest.calendar_sessions:
             raise ValueError("session result dates must exactly match the manifest calendar")
+        for index, result in enumerate(self.sessions):
+            expected_keys = tuple(
+                (instrument.symbol, session_date)
+                for instrument in self.manifest.instruments
+                for session_date in self.manifest.calendar_sessions[: index + 1]
+            )
+            actual_keys = tuple(
+                (bar.symbol, bar.session_date) for bar in result.market_snapshot.bars
+            )
+            if actual_keys != expected_keys:
+                raise ValueError("session market snapshots must match the cumulative PIT grid")
         if any(
             result.portfolio_snapshot.as_of.astimezone(UTC)
             != manifest_session.close_at.astimezone(UTC)

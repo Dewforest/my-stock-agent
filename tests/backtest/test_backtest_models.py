@@ -195,26 +195,58 @@ def submitted_plan(status: FillStatus = FillStatus.PENDING) -> OrderPlan:
     )
 
 
-def market_snapshot(as_of: datetime = US_CLOSE_2) -> MarketSnapshot:
-    return MarketSnapshot(as_of=as_of, market=Market.US, bars=())
-
-
-def close_bar(session_date: date = D2, as_of: datetime = US_CLOSE_2) -> Bar:
+def close_bar(
+    session_date: date = D2,
+    as_of: datetime = US_CLOSE_2,
+    *,
+    symbol: str = "AAPL",
+) -> Bar:
     return Bar(
-        **open_bar(session_date=session_date, open_at=as_of).model_dump(exclude={"volume"}),
+        **open_bar(symbol, session_date=session_date, open_at=as_of).model_dump(
+            exclude={"volume"}
+        ),
         volume=Decimal("10"),
     )
 
 
 def selected_revision(
-    session_date: date = D2, as_of: datetime = US_CLOSE_2
+    session_date: date = D2,
+    as_of: datetime = US_CLOSE_2,
+    *,
+    symbol: str = "AAPL",
 ) -> SelectedBarRevision:
     return SelectedBarRevision(
-        bar=close_bar(session_date, as_of),
+        bar=close_bar(session_date, as_of, symbol=symbol),
         ingested_at=as_of,
         source="feed",
-        source_record_id="row-1",
+        source_record_id=f"{symbol}-{session_date.isoformat()}",
     )
+
+
+def cumulative_revisions(
+    session_date: date,
+    *,
+    symbols: tuple[str, ...] = ("AAPL",),
+) -> tuple[SelectedBarRevision, ...]:
+    dated_closes = ((D1, US_CLOSE_1),) if session_date == D1 else (
+        (D1, US_CLOSE_1),
+        (D2, US_CLOSE_2),
+    )
+    return tuple(
+        selected_revision(bar_date, close_at, symbol=symbol)
+        for symbol in symbols
+        for bar_date, close_at in dated_closes
+    )
+
+
+def market_snapshot(
+    as_of: datetime = US_CLOSE_2,
+    *,
+    session_date: date = D2,
+    symbols: tuple[str, ...] = ("AAPL",),
+) -> MarketSnapshot:
+    revisions = cumulative_revisions(session_date, symbols=symbols)
+    return MarketSnapshot(as_of=as_of, market=Market.US, bars=tuple(r.bar for r in revisions))
 
 
 def strategy_intent(as_of: datetime = US_CLOSE_2) -> StrategyIntent:
@@ -243,13 +275,22 @@ def portfolio_snapshot(as_of: datetime = US_CLOSE_2) -> PortfolioSnapshot:
     )
 
 
-def session_result(session_date: date = D2) -> SessionResult:
+def session_result(
+    session_date: date = D2,
+    *,
+    symbols: tuple[str, ...] = ("AAPL",),
+) -> SessionResult:
     close_at = US_CLOSE_1 if session_date == D1 else US_CLOSE_2
+    revisions = cumulative_revisions(session_date, symbols=symbols)
     return SessionResult(
         session_date=session_date,
         execution_results=(),
-        selected_revisions=(),
-        market_snapshot=market_snapshot(close_at),
+        selected_revisions=revisions,
+        market_snapshot=MarketSnapshot(
+            as_of=close_at,
+            market=Market.US,
+            bars=tuple(revision.bar for revision in revisions),
+        ),
         portfolio_snapshot=portfolio_snapshot(close_at),
         intents=(),
         risk_decisions=(),
@@ -260,17 +301,29 @@ def session_result(session_date: date = D2) -> SessionResult:
 
 
 def session_result_with_execution(session_date: date = D2) -> SessionResult:
-    close_at = US_CLOSE_1 if session_date == D1 else US_CLOSE_2
-    revision = selected_revision(session_date, close_at)
     return SessionResult(
         **model_values(
             session_result(session_date),
-            exclude={"execution_results", "selected_revisions", "market_snapshot"},
+            exclude={"execution_results"},
         ),
         execution_results=(execution_result(session_date=session_date),),
-        selected_revisions=(revision,),
+    )
+
+
+def session_result_with_revisions(
+    session_date: date,
+    revisions: tuple[SelectedBarRevision, ...],
+) -> SessionResult:
+    close_at = US_CLOSE_1 if session_date == D1 else US_CLOSE_2
+    return SessionResult(
+        **model_values(
+            session_result(session_date), exclude={"selected_revisions", "market_snapshot"}
+        ),
+        selected_revisions=revisions,
         market_snapshot=MarketSnapshot(
-            as_of=close_at, market=Market.US, bars=(revision.bar,)
+            as_of=close_at,
+            market=Market.US,
+            bars=tuple(revision.bar for revision in revisions),
         ),
     )
 
@@ -619,14 +672,26 @@ def test_session_result_requires_selected_revision_bars_to_exactly_match_close_b
             )
 
 
-def test_session_result_requires_close_bars_to_match_session_date() -> None:
-    revision = selected_revision(D1, US_CLOSE_2)
+def test_session_result_accepts_historical_close_bars_but_rejects_future_bars() -> None:
+    historical = selected_revision(D1, US_CLOSE_1)
+    value = SessionResult(
+        **model_values(session_result(), exclude={"selected_revisions", "market_snapshot"}),
+        selected_revisions=(historical,),
+        market_snapshot=MarketSnapshot(
+            as_of=US_CLOSE_2, market=Market.US, bars=(historical.bar,)
+        ),
+    )
+    assert value.market_snapshot.bars == (historical.bar,)
+
+    future = selected_revision(D2, US_CLOSE_2)
     with pytest.raises(ValidationError):
         SessionResult(
-            **model_values(session_result(), exclude={"selected_revisions", "market_snapshot"}),
-            selected_revisions=(revision,),
+            **model_values(
+                session_result(D1), exclude={"selected_revisions", "market_snapshot"}
+            ),
+            selected_revisions=(future,),
             market_snapshot=MarketSnapshot(
-                as_of=US_CLOSE_2, market=Market.US, bars=(revision.bar,)
+                as_of=US_CLOSE_2, market=Market.US, bars=(future.bar,)
             ),
         )
 
@@ -761,6 +826,88 @@ def test_backtest_result_accepts_concrete_ledger_events_and_final_lots() -> None
     assert value.final_lots == (lot,)
 
 
+def test_backtest_result_accepts_symbol_major_cumulative_pit_grid() -> None:
+    symbols = ("AAPL", "MSFT")
+    multi_manifest = BacktestInputManifest(
+        **model_values(manifest(), exclude={"instruments", "sessions"}),
+        instruments=tuple(instrument(symbol) for symbol in symbols),
+        sessions=(
+            session(symbols=symbols),
+            session(D2, US_OPEN_2, US_CLOSE_2, symbols=symbols),
+        ),
+    )
+    value = BacktestResult(
+        **model_values(result(), exclude={"manifest", "sessions"}),
+        manifest=multi_manifest,
+        sessions=(
+            session_result(D1, symbols=symbols),
+            session_result(D2, symbols=symbols),
+        ),
+    )
+
+    assert tuple(
+        (bar.symbol, bar.session_date) for bar in value.sessions[0].market_snapshot.bars
+    ) == (("AAPL", D1), ("MSFT", D1))
+    assert tuple(
+        (bar.symbol, bar.session_date) for bar in value.sessions[1].market_snapshot.bars
+    ) == (("AAPL", D1), ("AAPL", D2), ("MSFT", D1), ("MSFT", D2))
+
+
+@pytest.mark.parametrize(
+    ("first_revisions", "second_revisions"),
+    [
+        ((), cumulative_revisions(D2)),
+        (cumulative_revisions(D1), (selected_revision(D2, US_CLOSE_2),)),
+        (cumulative_revisions(D1), (selected_revision(D1, US_CLOSE_1),)),
+        (
+            cumulative_revisions(D1),
+            (
+                selected_revision(D1 - timedelta(days=1), US_CLOSE_1 - timedelta(days=1)),
+                *cumulative_revisions(D2),
+            ),
+        ),
+        (
+            (selected_revision(D1, US_CLOSE_1, symbol="MSFT"),),
+            cumulative_revisions(D2, symbols=("MSFT",)),
+        ),
+    ],
+    ids=("empty", "only-current", "missing", "extra-past", "wrong-symbol"),
+)
+def test_backtest_result_rejects_nonexact_cumulative_pit_grid(
+    first_revisions: tuple[SelectedBarRevision, ...],
+    second_revisions: tuple[SelectedBarRevision, ...],
+) -> None:
+    with pytest.raises(ValidationError):
+        BacktestResult(
+            **model_values(result(), exclude={"sessions"}),
+            sessions=(
+                session_result_with_revisions(D1, first_revisions),
+                session_result_with_revisions(D2, second_revisions),
+            ),
+        )
+
+
+def test_backtest_result_rejects_future_and_noncanonical_grid_order() -> None:
+    with pytest.raises(ValidationError):
+        future = selected_revision(D2, US_CLOSE_2)
+        BacktestResult(
+            **model_values(result(), exclude={"sessions"}),
+            sessions=(
+                session_result_with_revisions(D1, (future,)),
+                session_result(D2),
+            ),
+        )
+
+    date_major = (
+        selected_revision(D1, US_CLOSE_1, symbol="AAPL"),
+        selected_revision(D1, US_CLOSE_1, symbol="MSFT"),
+        selected_revision(D2, US_CLOSE_2, symbol="AAPL"),
+        selected_revision(D2, US_CLOSE_2, symbol="MSFT"),
+    )
+    with pytest.raises(ValidationError):
+        session_result_with_revisions(D2, date_major)
+
+
 def test_backtest_result_links_pending_submission_to_next_session_execution() -> None:
     pending_plan = submitted_plan()
     first = SessionResult(
@@ -856,7 +1003,7 @@ def test_backtest_result_requires_final_session_to_skip_decisions_and_submission
                     session_result(D1),
                     exclude={"market_snapshot", "portfolio_snapshot"},
                 ),
-                market_snapshot=market_snapshot(US_CLOSE_2),
+                market_snapshot=market_snapshot(US_CLOSE_2, session_date=D1),
                 portfolio_snapshot=portfolio_snapshot(US_CLOSE_2),
             ),
             session_result(D2),
