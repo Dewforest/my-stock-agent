@@ -369,6 +369,7 @@ def test_backtest_package_exports_exact_contract() -> None:
     assert backtest.__all__ == [
         "BacktestInputManifest",
         "BacktestResult",
+        "BacktestRunner",
         "BacktestSession",
         "BacktestSpec",
         "OrderPlan",
