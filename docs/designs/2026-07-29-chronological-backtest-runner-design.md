@@ -212,7 +212,7 @@ Order IDs use canonical SHA-256 over `(run_id, decision_session, strategy_id, sy
 
 ## 9. Audit and Result Models
 
-`OrderPlan` is frozen with status `SUBMITTED`, `SKIPPED`, or `REJECTED`, source `STRATEGY` or `RISK_REDUCTION`, symbol, target weight, raw/submitted/effective quantity, optional `OrderIntent`, optional exact submission `Fill`, and stable reason. `SUBMITTED` means the simulator was called and must carry a submission result; immediate simulator rejection is preserved. SKIPPED/REJECTED plans carry no submission.
+`OrderPlan` is frozen with status `READY`, `SUBMITTED`, `SKIPPED`, or `REJECTED`, source `STRATEGY` or `RISK_REDUCTION`, symbol, target weight, raw/submitted/effective quantity, optional `OrderIntent`, optional exact submission `Fill`, and stable reason. Pure planning returns READY with an order but no submission. A pure `record_submission` transition converts READY to SUBMITTED and attaches the exact simulator result/effective requested quantity. SUBMITTED means the simulator was called and must carry a submission result; immediate simulator rejection is preserved. SKIPPED/REJECTED plans carry neither order submission nor simulator result; REJECTED never silently changes side.
 
 `SessionResult` is frozen and records session date, terminal open execution results, selected revision metadata, close market/portfolio snapshots, intents, risk decisions, optional reduction directive, order plans, and submission results. Terminal fills link to prior submissions by `order_id`.
 

@@ -204,7 +204,7 @@ Test exact frozen:
 
 - `BacktestSession` open/close ordering, plain date, execution-only open bars, complete sorted universe, CN/US state rules;
 - `BacktestSpec` identity, supported initial cash, fixed sorted instruments, chronological sessions, and config version;
-- `OrderPlan` state machine and quantity audit;
+- `OrderPlan` state machine (`READY -> SUBMITTED`, plus terminal `SKIPPED` / `REJECTED`) and quantity audit;
 - `SessionResult`, `BacktestInputManifest`, and `BacktestResult` exact immutable tuples and no live authority objects.
 
 Test full revalidation, subclass rejection where contracts require exact types, model-copy corruption resistance, no ambient context mutation, and exact public exports.
@@ -225,7 +225,7 @@ Test a pure planner for:
 
 **GREEN**
 
-Implement only frozen contracts, validation, canonical manifest payloads, and pure target/order planning. Do not query store, execute, or mutate ledger in this task.
+Implement only frozen contracts, validation, canonical manifest payloads, pure target/order planning, and the pure READY-to-SUBMITTED audit transition. Do not query store, execute, or mutate ledger in this task.
 
 **Verify and commit**
 
