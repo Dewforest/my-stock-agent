@@ -28,7 +28,7 @@ from stock_agent.account import (
 )
 from stock_agent.data import SelectedBarRevision
 from stock_agent.domain import Bar, Instrument, Market, PortfolioSnapshot, StrategyIntent
-from stock_agent.execution import Fill, OrderIntent
+from stock_agent.execution import Fill, FillStatus, OrderIntent
 from stock_agent.execution.cn_rules import CnSessionState
 from stock_agent.risk import RiskDecision, RiskReductionTarget
 from stock_agent.strategies import MarketSnapshot
@@ -455,18 +455,59 @@ class SessionResult(_ImmutableBacktestModel):
             raise ValueError("close snapshot instants must match")
         market = self.market_snapshot.market
         account = self.portfolio_snapshot.account_id
+        close_instant = self.market_snapshot.as_of.astimezone(UTC)
+        if tuple(item.bar for item in self.selected_revisions) != self.market_snapshot.bars:
+            raise ValueError("selected revision bars must exactly match the close market bars")
+        if any(item.session_date != self.session_date for item in self.market_snapshot.bars):
+            raise ValueError("close market bars must match the session date")
         if any(item.market is not market for item in self.intents):
             raise ValueError("intent markets must match the close market")
         if any(
-            item.as_of.astimezone(UTC) != self.market_snapshot.as_of.astimezone(UTC)
+            item.as_of.astimezone(UTC) != close_instant
             for item in self.intents
         ):
             raise ValueError("intent as_of values must match the close instant")
+        if tuple(item.original_intent for item in self.risk_decisions) != self.intents:
+            raise ValueError("risk decisions must exactly correspond to the strategy intents")
+        if self.risk_decisions and any(
+            item.risk_reduction != self.portfolio_reduction for item in self.risk_decisions
+        ):
+            raise ValueError("risk decision reductions must match the portfolio reduction")
         if any(
             item.market is not market or item.account_id != account
             for item in (*self.execution_results, *self.submission_results)
         ):
             raise ValueError("fill identity must match the close snapshots")
+        close_symbols = {item.symbol for item in self.market_snapshot.bars}
+        if any(item.symbol not in close_symbols for item in self.execution_results):
+            raise ValueError("execution symbols must occur in the close market snapshot")
+        if any(
+            item.status not in (FillStatus.FILLED, FillStatus.REJECTED)
+            or (item.status is FillStatus.FILLED and item.session_date != self.session_date)
+            for item in self.execution_results
+        ):
+            raise ValueError("execution results must be terminal for the session date")
+        if any(item.status is OrderPlanStatus.READY for item in self.order_plans):
+            raise ValueError("completed session results must not contain READY plans")
+        for plan in self.order_plans:
+            if plan.order is not None and (
+                plan.order.account_id != account
+                or plan.order.market is not market
+                or plan.order.symbol != plan.symbol
+            ):
+                raise ValueError("planned order identity must match the close snapshots")
+        planned_submissions = tuple(
+            plan.submission
+            for plan in self.order_plans
+            if plan.status is OrderPlanStatus.SUBMITTED
+        )
+        if planned_submissions != self.submission_results:
+            raise ValueError("submission results must exactly match submitted plans in order")
+        if any(
+            item.status not in (FillStatus.PENDING, FillStatus.REJECTED)
+            for item in self.submission_results
+        ):
+            raise ValueError("submission results must be pending or immediately rejected")
         return self
 
 
@@ -627,4 +668,36 @@ class BacktestResult(_ImmutableBacktestModel):
             raise ValueError("session snapshots must match manifest close instants")
         if self.sessions[-1].portfolio_snapshot != self.final_snapshot:
             raise ValueError("final snapshot must equal the final session snapshot")
+        if self.sessions[0].execution_results:
+            raise ValueError("the first session must not contain execution results")
+        execution_identity = (
+            "order_id",
+            "account_id",
+            "symbol",
+            "side",
+            "requested_quantity",
+        )
+        for previous, current in zip(self.sessions, self.sessions[1:], strict=False):
+            pending = tuple(
+                item
+                for item in previous.submission_results
+                if item.status is FillStatus.PENDING
+            )
+            if len(pending) != len(current.execution_results) or any(
+                any(
+                    getattr(submission, name) != getattr(execution, name)
+                    for name in execution_identity
+                )
+                for submission, execution in zip(pending, current.execution_results, strict=True)
+            ):
+                raise ValueError("pending submissions must exactly match next-session executions")
+        final = self.sessions[-1]
+        if (
+            final.intents
+            or final.risk_decisions
+            or final.portfolio_reduction is not None
+            or final.order_plans
+            or final.submission_results
+        ):
+            raise ValueError("the final session must skip strategy, risk, and submission")
         return self

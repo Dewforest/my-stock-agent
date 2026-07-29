@@ -149,6 +149,28 @@ def submission(status: FillStatus = FillStatus.PENDING) -> Fill:
     )
 
 
+def execution_result(
+    status: FillStatus = FillStatus.FILLED,
+    *,
+    session_date: date = D2,
+    order_id: str = "order-1",
+) -> Fill:
+    return Fill(
+        status=status,
+        order_id=order_id,
+        account_id="account-1",
+        symbol="AAPL",
+        market=Market.US,
+        side=Side.BUY,
+        requested_quantity=Decimal("2"),
+        filled_quantity=Decimal("2") if status is FillStatus.FILLED else Decimal("0"),
+        price=Decimal("100") if status is FillStatus.FILLED else None,
+        fees=Decimal("1") if status is FillStatus.FILLED else Decimal("0"),
+        session_date=session_date if status is FillStatus.FILLED else None,
+        reason=None if status is FillStatus.FILLED else "blocked",
+    )
+
+
 def ready_plan() -> OrderPlan:
     return OrderPlan(
         status=OrderPlanStatus.READY,
@@ -164,8 +186,49 @@ def ready_plan() -> OrderPlan:
     )
 
 
+def submitted_plan(status: FillStatus = FillStatus.PENDING) -> OrderPlan:
+    return OrderPlan(
+        **model_values(ready_plan(), exclude={"status", "submission", "effective_quantity"}),
+        status=OrderPlanStatus.SUBMITTED,
+        submission=submission(status),
+        effective_quantity=Decimal("2"),
+    )
+
+
 def market_snapshot(as_of: datetime = US_CLOSE_2) -> MarketSnapshot:
     return MarketSnapshot(as_of=as_of, market=Market.US, bars=())
+
+
+def close_bar(session_date: date = D2, as_of: datetime = US_CLOSE_2) -> Bar:
+    return Bar(
+        **open_bar(session_date=session_date, open_at=as_of).model_dump(exclude={"volume"}),
+        volume=Decimal("10"),
+    )
+
+
+def selected_revision(
+    session_date: date = D2, as_of: datetime = US_CLOSE_2
+) -> SelectedBarRevision:
+    return SelectedBarRevision(
+        bar=close_bar(session_date, as_of),
+        ingested_at=as_of,
+        source="feed",
+        source_record_id="row-1",
+    )
+
+
+def strategy_intent(as_of: datetime = US_CLOSE_2) -> StrategyIntent:
+    return StrategyIntent(
+        strategy_id="strategy-1",
+        symbol="AAPL",
+        market=Market.US,
+        side=Side.HOLD,
+        target_weight=Decimal("0"),
+        confidence=50,
+        as_of=as_of,
+        thesis="wait",
+        invalidation="change",
+    )
 
 
 def portfolio_snapshot(as_of: datetime = US_CLOSE_2) -> PortfolioSnapshot:
@@ -193,6 +256,22 @@ def session_result(session_date: date = D2) -> SessionResult:
         portfolio_reduction=None,
         order_plans=(),
         submission_results=(),
+    )
+
+
+def session_result_with_execution(session_date: date = D2) -> SessionResult:
+    close_at = US_CLOSE_1 if session_date == D1 else US_CLOSE_2
+    revision = selected_revision(session_date, close_at)
+    return SessionResult(
+        **model_values(
+            session_result(session_date),
+            exclude={"execution_results", "selected_revisions", "market_snapshot"},
+        ),
+        execution_results=(execution_result(session_date=session_date),),
+        selected_revisions=(revision,),
+        market_snapshot=MarketSnapshot(
+            as_of=close_at, market=Market.US, bars=(revision.bar,)
+        ),
     )
 
 
@@ -449,41 +528,33 @@ def test_submitted_order_plan_requires_submission_identity_to_match_order() -> N
 
 
 def test_session_result_accepts_auditable_exact_contract() -> None:
-    revision = SelectedBarRevision(
-        bar=Bar(
-            **open_bar(session_date=D2, open_at=US_CLOSE_2).model_dump(exclude={"volume"}),
-            volume=Decimal("10"),
-        ),
-        ingested_at=US_CLOSE_2,
-        source="feed",
-        source_record_id="row-1",
-    )
-    intent = StrategyIntent(
-        strategy_id="strategy-1",
-        symbol="AAPL",
-        market=Market.US,
-        side=Side.HOLD,
-        target_weight=Decimal("0"),
-        confidence=50,
-        as_of=US_CLOSE_2,
-        thesis="wait",
-        invalidation="change",
+    revision = selected_revision()
+    intent = strategy_intent()
+    reduction = RiskReductionTarget(
+        current_gross_exposure=Decimal("0.5"),
+        target_gross_exposure=Decimal("0.25"),
     )
     decision = RiskDecision(
         original_intent=intent,
         status=RiskDecisionStatus.APPROVED,
         approved_target_weight=Decimal("0"),
-    )
-    reduction = RiskReductionTarget(
-        current_gross_exposure=Decimal("0.5"),
-        target_gross_exposure=Decimal("0.25"),
+        risk_reduction=reduction,
     )
     value = SessionResult(
         **model_values(
             session_result(),
-            exclude={"selected_revisions", "intents", "risk_decisions", "portfolio_reduction"},
+            exclude={
+                "selected_revisions",
+                "market_snapshot",
+                "intents",
+                "risk_decisions",
+                "portfolio_reduction",
+            },
         ),
         selected_revisions=(revision,),
+        market_snapshot=MarketSnapshot(
+            as_of=US_CLOSE_2, market=Market.US, bars=(revision.bar,)
+        ),
         intents=(intent,),
         risk_decisions=(decision,),
         portfolio_reduction=reduction,
@@ -515,6 +586,132 @@ def test_session_result_requires_close_identity_and_as_of_consistency() -> None:
             **model_values(session_result(), exclude={"portfolio_snapshot"}),
             portfolio_snapshot=portfolio_snapshot(US_CLOSE_1),
         )
+
+
+def test_session_result_rejects_nonterminal_or_wrong_session_execution_results() -> None:
+    for fill in (submission(), execution_result(session_date=D1)):
+        with pytest.raises(ValidationError):
+            SessionResult(
+                **model_values(session_result(), exclude={"execution_results"}),
+                execution_results=(fill,),
+            )
+
+
+def test_session_result_rejects_execution_symbol_outside_close_snapshot() -> None:
+    fill = execution_result().model_copy(update={"symbol": "MSFT"})
+    with pytest.raises(ValidationError):
+        SessionResult(
+            **model_values(session_result(), exclude={"execution_results"}),
+            execution_results=(fill,),
+        )
+
+
+def test_session_result_requires_selected_revision_bars_to_exactly_match_close_bars() -> None:
+    revision = selected_revision()
+    for revisions, bars in (((revision,), ()), ((), (revision.bar,))):
+        with pytest.raises(ValidationError):
+            SessionResult(
+                **model_values(
+                    session_result(), exclude={"selected_revisions", "market_snapshot"}
+                ),
+                selected_revisions=revisions,
+                market_snapshot=MarketSnapshot(as_of=US_CLOSE_2, market=Market.US, bars=bars),
+            )
+
+
+def test_session_result_requires_close_bars_to_match_session_date() -> None:
+    revision = selected_revision(D1, US_CLOSE_2)
+    with pytest.raises(ValidationError):
+        SessionResult(
+            **model_values(session_result(), exclude={"selected_revisions", "market_snapshot"}),
+            selected_revisions=(revision,),
+            market_snapshot=MarketSnapshot(
+                as_of=US_CLOSE_2, market=Market.US, bars=(revision.bar,)
+            ),
+        )
+
+
+def test_session_result_requires_risk_decisions_to_match_intents_and_reduction() -> None:
+    intent = strategy_intent()
+    other = StrategyIntent(**model_values(intent, exclude={"strategy_id"}), strategy_id="other")
+    reduction = RiskReductionTarget(
+        current_gross_exposure=Decimal("0.5"), target_gross_exposure=Decimal("0.25")
+    )
+    wrong_reduction = RiskReductionTarget(
+        current_gross_exposure=Decimal("0.5"), target_gross_exposure=Decimal("0.2")
+    )
+    for decision in (
+        RiskDecision(
+            original_intent=other,
+            status=RiskDecisionStatus.APPROVED,
+            approved_target_weight=Decimal("0"),
+            risk_reduction=reduction,
+        ),
+        RiskDecision(
+            original_intent=intent,
+            status=RiskDecisionStatus.APPROVED,
+            approved_target_weight=Decimal("0"),
+            risk_reduction=wrong_reduction,
+        ),
+    ):
+        with pytest.raises(ValidationError):
+            SessionResult(
+                **model_values(
+                    session_result(),
+                    exclude={"intents", "risk_decisions", "portfolio_reduction"},
+                ),
+                intents=(intent,),
+                risk_decisions=(decision,),
+                portfolio_reduction=reduction,
+            )
+
+
+def test_session_result_rejects_ready_plans_and_requires_submissions_in_plan_order() -> None:
+    with pytest.raises(ValidationError):
+        SessionResult(
+            **model_values(session_result(), exclude={"order_plans"}),
+            order_plans=(ready_plan(),),
+        )
+
+    plan = submitted_plan()
+    with pytest.raises(ValidationError):
+        SessionResult(
+            **model_values(session_result(), exclude={"order_plans", "submission_results"}),
+            order_plans=(plan,),
+            submission_results=(),
+        )
+
+    filled_submission = execution_result()
+    filled_plan = OrderPlan(
+        **model_values(ready_plan(), exclude={"status", "submission", "effective_quantity"}),
+        status=OrderPlanStatus.SUBMITTED,
+        submission=filled_submission,
+        effective_quantity=Decimal("2"),
+    )
+    with pytest.raises(ValidationError):
+        SessionResult(
+            **model_values(session_result(), exclude={"order_plans", "submission_results"}),
+            order_plans=(filled_plan,),
+            submission_results=(filled_plan.submission,),
+        )
+
+
+def test_session_result_rejects_invalid_order_identity_and_accepts_immediate_rejection() -> None:
+    bad_order = order().model_copy(update={"account_id": "other"})
+    plan = OrderPlan(**model_values(ready_plan(), exclude={"order"}), order=bad_order)
+    with pytest.raises(ValidationError):
+        SessionResult(
+            **model_values(session_result(), exclude={"order_plans"}),
+            order_plans=(plan,),
+        )
+
+    rejected = submitted_plan(FillStatus.REJECTED)
+    value = SessionResult(
+        **model_values(session_result(), exclude={"order_plans", "submission_results"}),
+        order_plans=(rejected,),
+        submission_results=(rejected.submission,),
+    )
+    assert value.submission_results[0].status is FillStatus.REJECTED
 
 
 def test_manifest_contains_only_frozen_resolved_inputs() -> None:
@@ -562,6 +759,91 @@ def test_backtest_result_accepts_concrete_ledger_events_and_final_lots() -> None
     value = BacktestResult(**model_values(result(), exclude={"final_lots"}), final_lots=(lot,))
     assert type(value.ledger_events[0]) is CashInitialized
     assert value.final_lots == (lot,)
+
+
+def test_backtest_result_links_pending_submission_to_next_session_execution() -> None:
+    pending_plan = submitted_plan()
+    first = SessionResult(
+        **model_values(session_result(D1), exclude={"order_plans", "submission_results"}),
+        order_plans=(pending_plan,),
+        submission_results=(pending_plan.submission,),
+    )
+    second = session_result_with_execution()
+
+    value = BacktestResult(
+        **model_values(result(), exclude={"sessions"}), sessions=(first, second)
+    )
+
+    assert value.sessions[1].execution_results[0].order_id == "order-1"
+
+
+def test_backtest_result_does_not_carry_immediate_rejection() -> None:
+    rejected_plan = submitted_plan(FillStatus.REJECTED)
+    first = SessionResult(
+        **model_values(session_result(D1), exclude={"order_plans", "submission_results"}),
+        order_plans=(rejected_plan,),
+        submission_results=(rejected_plan.submission,),
+    )
+    BacktestResult(
+        **model_values(result(), exclude={"sessions"}), sessions=(first, session_result())
+    )
+
+
+def test_backtest_result_rejects_broken_cross_session_execution_chain() -> None:
+    first_with_execution = session_result_with_execution(D1)
+    with pytest.raises(ValidationError):
+        BacktestResult(
+            **model_values(result(), exclude={"sessions"}),
+            sessions=(first_with_execution, session_result()),
+        )
+
+    pending_plan = submitted_plan()
+    first = SessionResult(
+        **model_values(session_result(D1), exclude={"order_plans", "submission_results"}),
+        order_plans=(pending_plan,),
+        submission_results=(pending_plan.submission,),
+    )
+    wrong_execution = execution_result(order_id="other")
+    second = SessionResult(
+        **model_values(session_result_with_execution(), exclude={"execution_results"}),
+        execution_results=(wrong_execution,),
+    )
+    with pytest.raises(ValidationError):
+        BacktestResult(
+            **model_values(result(), exclude={"sessions"}), sessions=(first, second)
+        )
+
+
+def test_backtest_result_requires_final_session_to_skip_decisions_and_submissions() -> None:
+    pending_plan = submitted_plan()
+    final = SessionResult(
+        **model_values(session_result(), exclude={"order_plans", "submission_results"}),
+        order_plans=(pending_plan,),
+        submission_results=(pending_plan.submission,),
+    )
+    with pytest.raises(ValidationError):
+        BacktestResult(
+            **model_values(result(), exclude={"sessions"}),
+            sessions=(session_result(D1), final),
+        )
+
+    final_intent = strategy_intent()
+    final_with_strategy = SessionResult(
+        **model_values(session_result(), exclude={"intents", "risk_decisions"}),
+        intents=(final_intent,),
+        risk_decisions=(
+            RiskDecision(
+                original_intent=final_intent,
+                status=RiskDecisionStatus.APPROVED,
+                approved_target_weight=Decimal("0"),
+            ),
+        ),
+    )
+    with pytest.raises(ValidationError):
+        BacktestResult(
+            **model_values(result(), exclude={"sessions"}),
+            sessions=(session_result(D1), final_with_strategy),
+        )
 
 
 @pytest.mark.parametrize(
