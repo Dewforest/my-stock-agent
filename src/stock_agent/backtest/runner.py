@@ -178,8 +178,8 @@ class ChronologicalBacktestRunner:
             raise ValueError("strategy_id must be nonblank")
         if type(strategy.config_version) is not str or not strategy.config_version.strip():
             raise ValueError("strategy config_version must be nonblank")
-        if risk_engine is not None and type(risk_engine) is not RiskEngine:
-            raise TypeError("risk_engine must be exactly RiskEngine or None")
+        if risk_engine is not None and not isinstance(risk_engine, RiskEngine):
+            raise TypeError("risk_engine must be a RiskEngine or None")
         if type(transaction_cost_bps) is not Decimal:
             raise TypeError("transaction_cost_bps must be exactly Decimal")
         if not transaction_cost_bps.is_finite() or transaction_cost_bps < 0:

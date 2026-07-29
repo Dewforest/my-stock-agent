@@ -1,16 +1,21 @@
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import ROUND_UP, Decimal, Inexact, getcontext, localcontext
+from typing import Any
 
+import pytest
+
+import stock_agent.backtest.runner as runner_module
 from stock_agent.account import (
     CashInitialized,
     OpenExecutionBatchBooked,
+    PortfolioLedger,
     PortfolioMarked,
 )
 from stock_agent.backtest import BacktestSession, BacktestSpec, ChronologicalBacktestRunner
 from stock_agent.data import PointInTimeStore
 from stock_agent.domain import Bar, Currency, Instrument, Market, Side, StrategyIntent
-from stock_agent.execution import FillStatus
+from stock_agent.execution import ExecutionSimulator, FillStatus
 from stock_agent.market import TradingCalendar
 from stock_agent.risk import RiskEngine
 from stock_agent.strategies import StrategyContext
@@ -50,6 +55,104 @@ class ScriptedStrategy:
         )
 
 
+class CountingRiskEngine(RiskEngine):
+    def __init__(self) -> None:
+        self.contexts: list[tuple[str, object]] = []
+
+    def assess_portfolio(self, context):  # type: ignore[no-untyped-def]
+        self.contexts.append(("assess", context))
+        return super().assess_portfolio(context)
+
+    def evaluate_many(self, intents, context):  # type: ignore[no-untyped-def]
+        self.contexts.append(("evaluate", context))
+        return super().evaluate_many(intents, context)
+
+
+class StrategyIntentSubclass(StrategyIntent):
+    pass
+
+
+class TupleSubclass(tuple):
+    pass
+
+
+class CaseStrategy:
+    strategy_id = "case-strategy"
+    config_version = "v1"
+
+    def __init__(self, case: str) -> None:
+        self.case = case
+        self.calls = 0
+
+    def evaluate(self, context: StrategyContext) -> Any:
+        self.calls += 1
+        intent = StrategyIntent(
+            strategy_id=self.strategy_id,
+            symbol="AAPL",
+            market=Market.US,
+            side=Side.HOLD,
+            target_weight=Decimal(0),
+            confidence=100,
+            as_of=context.market_snapshot.as_of,
+            thesis="validation fixture",
+            invalidation="validation fixture",
+        )
+        if self.case == "list":
+            return [intent]
+        if self.case == "tuple-subclass-output":
+            return TupleSubclass((intent,))
+        if self.case == "tuple-subclass":
+            return (StrategyIntentSubclass.model_validate(intent.model_dump()),)
+        if self.case == "polluted":
+            return (
+                StrategyIntent.model_construct(
+                    strategy_id=self.strategy_id,
+                    symbol="AAPL",
+                    market=Market.US,
+                    side=Side.HOLD,
+                    target_weight=Decimal(0),
+                    confidence=100,
+                    as_of=context.market_snapshot.as_of,
+                    thesis="validation fixture",
+                ),
+            )
+        updates: dict[str, object] = {
+            "strategy-id": {"strategy_id": "other"},
+            "market": {"market": Market.CN},
+            "as-of": {"as_of": context.market_snapshot.as_of + timedelta(seconds=1)},
+            "symbol": {"symbol": "MSFT"},
+        }.get(self.case, {})
+        payload = {
+            name: getattr(intent, name) for name in StrategyIntent.model_fields
+        }
+        payload.update(updates)
+        candidate = StrategyIntent.model_validate(payload, strict=True)
+        if self.case == "duplicate":
+            return (candidate, candidate)
+        if self.case == "empty":
+            return ()
+        if self.case == "equivalent-as-of":
+            equivalent = context.market_snapshot.as_of.astimezone(
+                timezone(timedelta(hours=5))
+            )
+            payload["as_of"] = equivalent
+            return (StrategyIntent.model_validate(payload, strict=True),)
+        return (candidate,)
+
+
+class CountingScriptedStrategy:
+    strategy_id = "five-day-script"
+    config_version = "v1"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self._delegate = ScriptedStrategy()
+
+    def evaluate(self, context: StrategyContext) -> tuple[StrategyIntent, ...]:
+        self.calls += 1
+        return self._delegate.evaluate(context)
+
+
 def _instant(session_date: date, hour: int) -> datetime:
     return datetime(session_date.year, session_date.month, session_date.day, hour, tzinfo=UTC)
 
@@ -68,7 +171,9 @@ def _bar(session_date: date, price: Decimal, *, at: datetime, volume: Decimal) -
     )
 
 
-def _fixture() -> tuple[PointInTimeStore, TradingCalendar, BacktestSpec]:
+def _fixture(
+    *, missing_close_dates: tuple[date, ...] = ()
+) -> tuple[PointInTimeStore, TradingCalendar, BacktestSpec]:
     calendar = TradingCalendar(Market.US, DATES)
     sessions = tuple(
         BacktestSession(
@@ -106,6 +211,8 @@ def _fixture() -> tuple[PointInTimeStore, TradingCalendar, BacktestSpec]:
     for session_date, open_price, close_price in zip(
         DATES, OPEN_PRICES, CLOSE_PRICES, strict=True
     ):
+        if session_date in missing_close_dates:
+            continue
         close_at = _instant(session_date, 21)
         store.append_bar(
             Bar(
@@ -124,6 +231,18 @@ def _fixture() -> tuple[PointInTimeStore, TradingCalendar, BacktestSpec]:
             source_record_id=f"AAPL-{session_date.isoformat()}",
         )
     return store, calendar, spec
+
+
+def _spec_with(spec: BacktestSpec, **updates: object) -> BacktestSpec:
+    payload = {name: getattr(spec, name) for name in BacktestSpec.model_fields}
+    payload.update(updates)
+    return BacktestSpec.model_validate(payload, strict=True)
+
+
+def _session_with(session: BacktestSession, **updates: object) -> BacktestSession:
+    payload = {name: getattr(session, name) for name in BacktestSession.model_fields}
+    payload.update(updates)
+    return BacktestSession.model_validate(payload, strict=True)
 
 
 def _decimal_context_signature() -> tuple[object, ...]:
@@ -269,3 +388,459 @@ def test_five_session_run_is_isolated_from_hostile_decimal_context() -> None:
 
     expected_store.close()
     hostile_store.close()
+
+
+def test_risk_is_assessed_and_evaluated_once_with_same_context_each_nonfinal_day() -> None:
+    store, calendar, spec = _fixture()
+    risk = CountingRiskEngine()
+    runner = ChronologicalBacktestRunner(
+        store=store,
+        calendar=calendar,
+        strategy=ScriptedStrategy(),
+        risk_engine=risk,
+        transaction_cost_bps=Decimal("10"),
+    )
+
+    runner.run(spec)
+
+    assert tuple(kind for kind, _ in risk.contexts) == (
+        "assess",
+        "evaluate",
+        "assess",
+        "evaluate",
+        "assess",
+        "evaluate",
+        "assess",
+        "evaluate",
+    )
+    for assess, evaluate in zip(risk.contexts[::2], risk.contexts[1::2], strict=True):
+        assert assess[1] is evaluate[1]
+    store.close()
+
+
+def test_config_version_mismatch_fails_before_strategy_execution() -> None:
+    store, calendar, spec = _fixture()
+    strategy = CountingScriptedStrategy()
+    runner = ChronologicalBacktestRunner(
+        store=store, calendar=calendar, strategy=strategy
+    )
+
+    with pytest.raises(ValueError, match="strategy config version must match exactly"):
+        runner.run(_spec_with(spec, strategy_config_version="v2"))
+
+    assert strategy.calls == 0
+    store.close()
+
+
+def test_spec_market_must_match_runner_calendar() -> None:
+    store, _, spec = _fixture()
+    runner = ChronologicalBacktestRunner(
+        store=store,
+        calendar=TradingCalendar(Market.CN, DATES),
+        strategy=ScriptedStrategy(),
+    )
+
+    with pytest.raises(ValueError, match="spec market must match runner calendar"):
+        runner.run(spec)
+    store.close()
+
+
+def test_spec_sessions_must_be_an_exact_contiguous_calendar_slice() -> None:
+    store, calendar, spec = _fixture()
+    gapped = _spec_with(spec, sessions=(spec.sessions[0], *spec.sessions[2:]))
+    runner = ChronologicalBacktestRunner(
+        store=store, calendar=calendar, strategy=ScriptedStrategy()
+    )
+
+    with pytest.raises(ValueError, match="spec dates must be a contiguous calendar slice"):
+        runner.run(gapped)
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    (
+        ("list", TypeError, "strategy output must be an exact tuple"),
+        ("tuple-subclass-output", TypeError, "strategy output must be an exact tuple"),
+        ("tuple-subclass", TypeError, "strategy intent must be exactly StrategyIntent"),
+        ("polluted", ValueError, "nested model is missing a required field"),
+        ("strategy-id", ValueError, "strategy intent strategy_id must match the strategy"),
+        ("market", ValueError, "strategy intent market must match the spec"),
+        ("as-of", ValueError, "strategy intent as_of must match the session close"),
+        ("symbol", ValueError, "strategy intent symbol must belong to the fixed universe"),
+        ("duplicate", ValueError, "strategy intent symbols must be unique"),
+    ),
+)
+def test_invalid_strategy_output_fails_before_planning_submission(
+    case: str,
+    error: type[Exception],
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, calendar, spec = _fixture()
+    planning_calls: list[object] = []
+
+    def unexpected_planning(*args: object, **kwargs: object) -> None:
+        planning_calls.append((args, kwargs))
+        raise AssertionError("planning must not be called")
+
+    monkeypatch.setattr(runner_module, "plan_orders", unexpected_planning)
+    runner = ChronologicalBacktestRunner(
+        store=store, calendar=calendar, strategy=CaseStrategy(case)
+    )
+
+    with pytest.raises(error, match=message):
+        runner.run(spec)
+
+    assert planning_calls == []
+    store.close()
+
+
+@pytest.mark.parametrize("case", ("empty", "equivalent-as-of"))
+def test_legal_strategy_outputs_complete(case: str) -> None:
+    store, calendar, spec = _fixture()
+    result = ChronologicalBacktestRunner(
+        store=store, calendar=calendar, strategy=CaseStrategy(case)
+    ).run(spec)
+
+    assert len(result.sessions) == len(DATES)
+    if case == "empty":
+        assert all(session.intents == () for session in result.sessions)
+    store.close()
+
+
+def test_missing_current_close_does_not_append_mark_or_call_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, calendar, spec = _fixture(missing_close_dates=(DATES[0],))
+    strategy = CountingScriptedStrategy()
+    ledgers: list[PortfolioLedger] = []
+
+    def tracking_ledger(account_id: str, market: Market) -> PortfolioLedger:
+        ledger = PortfolioLedger(account_id, market)
+        ledgers.append(ledger)
+        return ledger
+
+    monkeypatch.setattr(runner_module, "PortfolioLedger", tracking_ledger)
+    runner = ChronologicalBacktestRunner(
+        store=store, calendar=calendar, strategy=strategy
+    )
+
+    with pytest.raises(
+        ValueError, match=f"missing point-in-time bar for AAPL on {DATES[0].isoformat()}"
+    ):
+        runner.run(spec)
+
+    assert tuple(type(event) for event in ledgers[0].events) == (CashInitialized,)
+    assert strategy.calls == 0
+    store.close()
+
+
+def test_missing_cumulative_close_does_not_append_that_session_mark_or_call_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, calendar, spec = _fixture()
+    strategy = CountingScriptedStrategy()
+    ledgers: list[PortfolioLedger] = []
+    original = PointInTimeStore.latest_bar_revision_as_of
+
+    def intermittently_missing(self: PointInTimeStore, **kwargs: object):  # type: ignore[no-untyped-def]
+        if kwargs["session_date"] == DATES[0] and kwargs["as_of"] == spec.sessions[1].close_at:
+            return None
+        return original(self, **kwargs)  # type: ignore[arg-type]
+
+    def tracking_ledger(account_id: str, market: Market) -> PortfolioLedger:
+        ledger = PortfolioLedger(account_id, market)
+        ledgers.append(ledger)
+        return ledger
+
+    monkeypatch.setattr(
+        PointInTimeStore, "latest_bar_revision_as_of", intermittently_missing
+    )
+    monkeypatch.setattr(runner_module, "PortfolioLedger", tracking_ledger)
+    runner = ChronologicalBacktestRunner(
+        store=store,
+        calendar=calendar,
+        strategy=strategy,
+        transaction_cost_bps=Decimal("10"),
+    )
+
+    with pytest.raises(
+        ValueError, match=f"missing point-in-time bar for AAPL on {DATES[0].isoformat()}"
+    ):
+        runner.run(spec)
+
+    marks = tuple(
+        event for event in ledgers[0].events if type(event) is PortfolioMarked
+    )
+    assert tuple(event.session_date for event in marks) == (DATES[0],)
+    assert strategy.calls == 1
+    store.close()
+
+
+def test_day_start_cash_and_new_position_notional_are_session_scoped() -> None:
+    store, calendar, spec = _fixture()
+    risk = CountingRiskEngine()
+    ChronologicalBacktestRunner(
+        store=store,
+        calendar=calendar,
+        strategy=ScriptedStrategy(),
+        risk_engine=risk,
+        transaction_cost_bps=Decimal("10"),
+    ).run(spec)
+
+    contexts = tuple(item[1] for item in risk.contexts[::2])
+    assert contexts[1].day_start_available_cash == Decimal("1000")  # type: ignore[attr-defined]
+    assert contexts[1].portfolio.cash == Decimal("834.835000000000")  # type: ignore[attr-defined]
+    assert contexts[1].new_position_notional_committed_today == Decimal("165.000000000000")  # type: ignore[attr-defined]
+    assert contexts[2].day_start_available_cash == Decimal("834.835000000000")  # type: ignore[attr-defined]
+    assert contexts[2].new_position_notional_committed_today == 0  # type: ignore[attr-defined]
+    store.close()
+
+
+def test_happy_path_pending_orders_terminate_only_at_the_next_open() -> None:
+    store, calendar, spec = _fixture()
+    result = ChronologicalBacktestRunner(
+        store=store, calendar=calendar, strategy=ScriptedStrategy()
+    ).run(spec)
+
+    for previous, current in zip(result.sessions, result.sessions[1:], strict=False):
+        pending = tuple(
+            item for item in previous.submission_results if item.status is FillStatus.PENDING
+        )
+        assert tuple(item.order_id for item in current.execution_results) == tuple(
+            item.order_id for item in pending
+        )
+        assert all(
+            item.status in (FillStatus.FILLED, FillStatus.REJECTED)
+            for item in current.execution_results
+        )
+        later_ids = {
+            item.order_id
+            for later in result.sessions[result.sessions.index(current) + 1 :]
+            for item in later.execution_results
+        }
+        assert later_ids.isdisjoint(item.order_id for item in pending)
+    store.close()
+
+
+def test_runner_guard_rejects_nonterminal_next_open_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NonterminalSimulator(ExecutionSimulator):
+        def process_session(self, **kwargs):  # type: ignore[no-untyped-def]
+            results = super().process_session(**kwargs)
+            if results:
+                return tuple(
+                    item.model_copy(update={"status": FillStatus.PENDING})
+                    for item in results
+                )
+            return results
+
+    store, calendar, spec = _fixture()
+    monkeypatch.setattr(runner_module, "ExecutionSimulator", NonterminalSimulator)
+    runner = ChronologicalBacktestRunner(
+        store=store, calendar=calendar, strategy=ScriptedStrategy()
+    )
+
+    with pytest.raises(
+        ValueError, match="all prior pending orders must terminate at the next open"
+    ):
+        runner.run(spec)
+    store.close()
+
+
+def test_gap_up_cash_rejection_is_audited_without_ledger_booking() -> None:
+    store, calendar, spec = _fixture()
+    gap_session = _session_with(
+        spec.sessions[1],
+        open_bars=(
+            _bar(
+                DATES[1],
+                Decimal("1000"),
+                at=spec.sessions[1].open_at,
+                volume=Decimal(0),
+            ),
+        ),
+    )
+    gap_spec = _spec_with(
+        spec, sessions=(spec.sessions[0], gap_session, *spec.sessions[2:])
+    )
+    result = ChronologicalBacktestRunner(
+        store=store,
+        calendar=calendar,
+        strategy=ScriptedStrategy(),
+        transaction_cost_bps=Decimal("10"),
+    ).run(gap_spec)
+
+    rejection = result.sessions[1].execution_results
+    assert len(rejection) == 1
+    assert rejection[0].status is FillStatus.REJECTED
+    assert rejection[0].reason == "insufficient available cash"
+    assert not any(
+        type(event) is OpenExecutionBatchBooked and event.session_date == DATES[1]
+        for event in result.ledger_events
+    )
+    assert result.sessions[1].portfolio_snapshot.cash == Decimal("1000")
+    assert result.final_lots == ()
+    assert result.final_snapshot.cash == Decimal("1000")
+    store.close()
+
+
+def test_ledger_append_failure_aborts_with_only_successful_prefix_and_no_later_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledgers: list[PortfolioLedger] = []
+
+    class FailingLedger(PortfolioLedger):
+        def append(self, event) -> None:  # type: ignore[no-untyped-def]
+            if type(event) is PortfolioMarked and event.session_date == DATES[1]:
+                raise ValueError("injected ledger invariant failure")
+            super().append(event)
+
+    def failing_ledger(account_id: str, market: Market) -> PortfolioLedger:
+        ledger = FailingLedger(account_id, market)
+        ledgers.append(ledger)
+        return ledger
+
+    store, calendar, spec = _fixture()
+    strategy = CountingScriptedStrategy()
+    monkeypatch.setattr(runner_module, "PortfolioLedger", failing_ledger)
+    runner = ChronologicalBacktestRunner(
+        store=store, calendar=calendar, strategy=strategy
+    )
+
+    with pytest.raises(ValueError, match="injected ledger invariant failure"):
+        runner.run(spec)
+
+    assert tuple(type(event) for event in ledgers[0].events) == (
+        CashInitialized,
+        PortfolioMarked,
+        OpenExecutionBatchBooked,
+    )
+    assert strategy.calls == 1
+    store.close()
+
+
+def test_multiple_successful_fills_share_one_ordered_open_batch_with_complete_marks() -> None:
+    two_dates = DATES[:2]
+    instruments = (
+        Instrument(
+            symbol="AAPL",
+            market=Market.US,
+            currency=Currency.USD,
+            sector="Technology",
+        ),
+        Instrument(
+            symbol="MSFT",
+            market=Market.US,
+            currency=Currency.USD,
+            sector="Technology",
+        ),
+    )
+
+    def frame_bar(symbol: str, session_date: date, price: Decimal) -> Bar:
+        return Bar(
+            symbol=symbol,
+            market=Market.US,
+            session_date=session_date,
+            open=price,
+            high=price,
+            low=price,
+            close=price,
+            volume=Decimal(0),
+            available_at=_instant(session_date, 14),
+        )
+
+    sessions = (
+        BacktestSession(
+            session_date=two_dates[0],
+            open_at=_instant(two_dates[0], 14),
+            close_at=_instant(two_dates[0], 21),
+            open_bars=(
+                frame_bar("AAPL", two_dates[0], Decimal("100")),
+                frame_bar("MSFT", two_dates[0], Decimal("100")),
+            ),
+        ),
+        BacktestSession(
+            session_date=two_dates[1],
+            open_at=_instant(two_dates[1], 14),
+            close_at=_instant(two_dates[1], 21),
+            open_bars=(
+                frame_bar("AAPL", two_dates[1], Decimal("110")),
+                frame_bar("MSFT", two_dates[1], Decimal("90")),
+            ),
+        ),
+    )
+    spec = BacktestSpec(
+        run_id="two-fill-run",
+        account_id="account-1",
+        market=Market.US,
+        initial_cash=Decimal("1000"),
+        instruments=instruments,
+        sessions=sessions,
+        strategy_config_version="v1",
+    )
+    store = PointInTimeStore()
+    closes = ((Decimal("100"), Decimal("100")), (Decimal("120"), Decimal("95")))
+    for session, prices in zip(sessions, closes, strict=True):
+        for instrument, close in zip(instruments, prices, strict=True):
+            close_at = session.close_at
+            store.append_bar(
+                Bar(
+                    symbol=instrument.symbol,
+                    market=Market.US,
+                    session_date=session.session_date,
+                    open=close,
+                    high=close,
+                    low=close,
+                    close=close,
+                    volume=Decimal("1000"),
+                    available_at=close_at,
+                ),
+                ingested_at=close_at + timedelta(seconds=1),
+                source="fixture",
+                source_record_id=f"{instrument.symbol}-{session.session_date}",
+            )
+
+    class TwoBuyStrategy:
+        strategy_id = "two-buy"
+        config_version = "v1"
+
+        def evaluate(self, context: StrategyContext) -> tuple[StrategyIntent, ...]:
+            return tuple(
+                StrategyIntent(
+                    strategy_id=self.strategy_id,
+                    symbol=symbol,
+                    market=Market.US,
+                    side=Side.BUY,
+                    target_weight=Decimal("0.05"),
+                    confidence=100,
+                    as_of=context.market_snapshot.as_of,
+                    thesis="two fill fixture",
+                    invalidation="two fill fixture",
+                )
+                for symbol in ("AAPL", "MSFT")
+            )
+
+    result = ChronologicalBacktestRunner(
+        store=store,
+        calendar=TradingCalendar(Market.US, two_dates),
+        strategy=TwoBuyStrategy(),
+    ).run(spec)
+
+    batches = tuple(
+        event for event in result.ledger_events if type(event) is OpenExecutionBatchBooked
+    )
+    assert len(batches) == 1
+    assert batches[0].session_date == two_dates[1]
+    assert tuple(fill.symbol for fill in batches[0].fills) == ("AAPL", "MSFT")
+    assert tuple(mark.symbol for mark in batches[0].marks) == ("AAPL", "MSFT")
+    assert tuple(mark.price for mark in batches[0].marks) == (
+        Decimal("110"),
+        Decimal("90"),
+    )
+    assert tuple(
+        revision.bar.symbol for revision in result.sessions[1].selected_revisions
+    ) == ("AAPL", "AAPL", "MSFT", "MSFT")
+    store.close()
