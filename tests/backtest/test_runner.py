@@ -154,6 +154,30 @@ class CountingScriptedStrategy:
         return self._delegate.evaluate(context)
 
 
+class MutableIdentityStrategy:
+    def __init__(self) -> None:
+        self.identity_reads = {"strategy_id": 0, "config_version": 0}
+        self.raise_on_identity_read = False
+        self._delegate = ScriptedStrategy()
+
+    @property
+    def strategy_id(self) -> str:
+        self.identity_reads["strategy_id"] += 1
+        if self.raise_on_identity_read:
+            raise AssertionError("strategy_id must be frozen")
+        return "five-day-script"
+
+    @property
+    def config_version(self) -> str:
+        self.identity_reads["config_version"] += 1
+        if self.raise_on_identity_read:
+            raise AssertionError("config_version must be frozen")
+        return "v1"
+
+    def evaluate(self, context: StrategyContext) -> tuple[StrategyIntent, ...]:
+        return self._delegate.evaluate(context)
+
+
 def _instant(session_date: date, hour: int) -> datetime:
     return datetime(session_date.year, session_date.month, session_date.day, hour, tzinfo=UTC)
 
@@ -890,6 +914,49 @@ def test_successful_run_is_cached_before_store_strategy_and_execution_constructi
     assert second is first
     assert second.resolved_data_fingerprint == original_fingerprint
     assert second.sessions == first.sessions
+    store.close()
+
+
+def test_strategy_identity_is_read_once_and_never_touched_after_construction() -> None:
+    store, calendar, spec = _fixture()
+    strategy = MutableIdentityStrategy()
+    runner = ChronologicalBacktestRunner(
+        store=store,
+        calendar=calendar,
+        strategy=strategy,
+        transaction_cost_bps=Decimal("10"),
+    )
+
+    first = runner.run(spec)
+
+    assert strategy.identity_reads == {"strategy_id": 1, "config_version": 1}
+    strategy.raise_on_identity_read = True
+    second = runner.run(spec)
+
+    assert second is first
+    assert strategy.identity_reads == {"strategy_id": 1, "config_version": 1}
+    store.close()
+
+
+def test_cached_identity_and_conflict_use_frozen_calendar_and_strategy() -> None:
+    store, calendar, spec = _fixture()
+    strategy = MutableIdentityStrategy()
+    runner = ChronologicalBacktestRunner(
+        store=store, calendar=calendar, strategy=strategy
+    )
+    first = runner.run(spec)
+    strategy.raise_on_identity_read = True
+    object.__setattr__(calendar, "market", Market.CN)
+    object.__setattr__(calendar, "sessions", tuple(reversed(DATES)))
+
+    assert runner.run(spec) is first
+    with pytest.raises(
+        ValueError,
+        match=r"^run_id conflicts with a different backtest specification$",
+    ):
+        runner.run(_spec_with(spec, initial_cash=Decimal("1001")))
+
+    assert strategy.identity_reads == {"strategy_id": 1, "config_version": 1}
     store.close()
 
 

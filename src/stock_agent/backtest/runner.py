@@ -19,6 +19,7 @@ from decimal import (
     Underflow,
     localcontext,
 )
+from inspect import getattr_static
 from typing import TypeVar
 
 from pydantic import BaseModel
@@ -214,11 +215,20 @@ class ChronologicalBacktestRunner:
             raise TypeError("store must be exactly PointInTimeStore")
         if type(calendar) is not TradingCalendar:
             raise TypeError("calendar must be exactly TradingCalendar")
-        if not isinstance(strategy, Strategy):
+        try:
+            getattr_static(strategy, "strategy_id")
+            getattr_static(strategy, "config_version")
+            getattr_static(strategy, "evaluate")
+            evaluate = strategy.evaluate
+        except AttributeError as error:
+            raise TypeError("strategy must implement Strategy") from error
+        if not callable(evaluate):
             raise TypeError("strategy must implement Strategy")
-        if type(strategy.strategy_id) is not str or not strategy.strategy_id.strip():
+        strategy_id = strategy.strategy_id
+        config_version = strategy.config_version
+        if type(strategy_id) is not str or not strategy_id.strip():
             raise ValueError("strategy_id must be nonblank")
-        if type(strategy.config_version) is not str or not strategy.config_version.strip():
+        if type(config_version) is not str or not config_version.strip():
             raise ValueError("strategy config_version must be nonblank")
         if risk_engine is not None and not isinstance(risk_engine, RiskEngine):
             raise TypeError("risk_engine must be a RiskEngine or None")
@@ -228,7 +238,11 @@ class ChronologicalBacktestRunner:
             raise ValueError("transaction_cost_bps must be finite and nonnegative")
         self._store = store
         self._calendar = calendar
+        self._calendar_market = calendar.market
+        self._calendar_sessions = tuple(calendar.sessions)
         self._strategy = strategy
+        self._strategy_id = strategy_id.strip()
+        self._strategy_config_version = config_version.strip()
         self._risk_engine = RiskEngine() if risk_engine is None else risk_engine
         self._transaction_cost_bps = _canonical_decimal_value(transaction_cost_bps)
         self._registry: dict[str, tuple[str, BacktestResult]] = {}
@@ -254,7 +268,7 @@ class ChronologicalBacktestRunner:
             instruments=clean_spec.instruments,
             calendar_sessions=calendar_slice,
             sessions=clean_spec.sessions,
-            strategy_id=self._strategy.strategy_id.strip(),
+            strategy_id=self._strategy_id,
             strategy_config_version=clean_spec.strategy_config_version,
             transaction_cost_bps=self._transaction_cost_bps,
             pit_knowledge_policy=_PIT_POLICY,
@@ -388,7 +402,7 @@ class ChronologicalBacktestRunner:
                 planned = plan_orders(
                     run_id=clean_spec.run_id,
                     decision_session=session.session_date,
-                    strategy_id=self._strategy.strategy_id.strip(),
+                    strategy_id=self._strategy_id,
                     market_snapshot=market_snapshot,
                     portfolio=portfolio,
                     risk_decisions=risk_decisions,
@@ -450,16 +464,16 @@ class ChronologicalBacktestRunner:
         return result
 
     def _validate_spec(self, spec: BacktestSpec) -> tuple[date, ...]:
-        if spec.market is not self._calendar.market:
+        if spec.market is not self._calendar_market:
             raise ValueError("spec market must match runner calendar")
-        if spec.strategy_config_version != self._strategy.config_version:
+        if spec.strategy_config_version != self._strategy_config_version:
             raise ValueError("strategy config version must match exactly")
         dates = tuple(item.session_date for item in spec.sessions)
         try:
-            start = self._calendar.sessions.index(dates[0])
+            start = self._calendar_sessions.index(dates[0])
         except ValueError as error:
             raise ValueError("spec dates must be a contiguous calendar slice") from error
-        expected = self._calendar.sessions[start : start + len(dates)]
+        expected = self._calendar_sessions[start : start + len(dates)]
         if dates != expected:
             raise ValueError("spec dates must be a contiguous calendar slice")
         return expected
@@ -601,7 +615,7 @@ class ChronologicalBacktestRunner:
         symbols: list[str] = []
         close_at = market_snapshot.as_of.astimezone(UTC)
         for item in intents:
-            if item.strategy_id != self._strategy.strategy_id.strip():
+            if item.strategy_id != self._strategy_id:
                 raise ValueError("strategy intent strategy_id must match the strategy")
             if item.market is not spec.market:
                 raise ValueError("strategy intent market must match the spec")
