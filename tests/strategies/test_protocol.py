@@ -76,8 +76,13 @@ def context_values(**overrides: object) -> dict[str, object]:
     return values
 
 
-def test_interim_public_exports_are_exact() -> None:
-    assert strategies.__all__ == ["MarketSnapshot", "Strategy", "StrategyContext"]
+def test_public_protocol_exports_are_available() -> None:
+    assert strategies.__all__ == [
+        "MarketSnapshot",
+        "MovingAverageFixtureStrategy",
+        "Strategy",
+        "StrategyContext",
+    ]
     assert strategies.MarketSnapshot is MarketSnapshot
     assert strategies.StrategyContext is StrategyContext
     assert strategies.Strategy is Strategy
