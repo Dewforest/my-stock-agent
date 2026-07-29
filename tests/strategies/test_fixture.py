@@ -376,6 +376,7 @@ def test_evidence_matches_independent_literal_canonical_json_sha256() -> None:
     )
     expected = f"bar-sha256:{hashlib.sha256(canonical_payload).hexdigest()}"
 
+    assert expected == "bar-sha256:481d5c3e8ceff71f4fc65db6cede2fdc79727edf011373e03be1e84ce8284b4e"
     assert intent.evidence_ids == (expected,)
     assert intent.evidence_ids[0].startswith("bar-sha256:")
     assert len(intent.evidence_ids[0]) == len("bar-sha256:") + 64

@@ -1,8 +1,5 @@
-import hashlib
-import json
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC
 from decimal import (
     MAX_EMAX,
     MAX_PREC,
@@ -23,6 +20,7 @@ from decimal import (
 )
 from itertools import zip_longest
 
+from stock_agent.audit import canonical_datetime, canonical_decimal, tagged_sha256
 from stock_agent.domain import Bar, Side, StrategyIntent
 from stock_agent.strategies.protocol import StrategyContext
 
@@ -198,30 +196,15 @@ def _compare_tenfold_to_decimal(left: Decimal, right: Decimal) -> int:
 
 
 def _bar_evidence_id(item: Bar) -> str:
-    payload = [
+    payload = (
         item.market.value,
         item.symbol,
         item.session_date.isoformat(),
-        _canonical_decimal(item.open),
-        _canonical_decimal(item.high),
-        _canonical_decimal(item.low),
-        _canonical_decimal(item.close),
-        _canonical_decimal(item.volume),
-        item.available_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-    ]
-    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return f"bar-sha256:{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _canonical_decimal(value: Decimal) -> str:
-    if value.is_zero():
-        return "0"
-    decimal_tuple = value.as_tuple()
-    digits = list(decimal_tuple.digits)
-    exponent = int(decimal_tuple.exponent)
-    while digits[-1] == 0:
-        digits.pop()
-        exponent += 1
-    coefficient = "".join(str(digit) for digit in digits)
-    sign = "-" if decimal_tuple.sign else ""
-    return f"{sign}{coefficient}e{exponent}"
+        canonical_decimal(item.open),
+        canonical_decimal(item.high),
+        canonical_decimal(item.low),
+        canonical_decimal(item.close),
+        canonical_decimal(item.volume),
+        canonical_datetime(item.available_at),
+    )
+    return tagged_sha256("bar", payload)
