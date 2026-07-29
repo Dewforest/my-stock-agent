@@ -668,6 +668,163 @@ def test_latest_revision_returns_selected_bar_and_metadata() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("winner_metadata", "conflicting_metadata"),
+    [
+        pytest.param(
+            (
+                datetime(2026, 7, 25, 1, tzinfo=UTC),
+                datetime(2026, 7, 25, 1, tzinfo=UTC),
+                "alpha-feed",
+                "record-a",
+            ),
+            (
+                datetime(2026, 7, 25, tzinfo=UTC),
+                datetime(2026, 7, 25, 4, tzinfo=UTC),
+                "zulu-feed",
+                "record-z",
+            ),
+            id="available-at-before-later-ingestion-source-and-id",
+        ),
+        pytest.param(
+            (
+                datetime(2026, 7, 25, tzinfo=UTC),
+                datetime(2026, 7, 25, 2, tzinfo=UTC),
+                "alpha-feed",
+                "record-a",
+            ),
+            (
+                datetime(2026, 7, 25, tzinfo=UTC),
+                datetime(2026, 7, 25, 1, tzinfo=UTC),
+                "zulu-feed",
+                "record-z",
+            ),
+            id="ingested-at-before-larger-source-and-id",
+        ),
+        pytest.param(
+            (
+                datetime(2026, 7, 25, tzinfo=UTC),
+                datetime(2026, 7, 25, 1, tzinfo=UTC),
+                "zulu-feed",
+                "record-a",
+            ),
+            (
+                datetime(2026, 7, 25, tzinfo=UTC),
+                datetime(2026, 7, 25, 1, tzinfo=UTC),
+                "alpha-feed",
+                "record-z",
+            ),
+            id="source-before-larger-id",
+        ),
+        pytest.param(
+            (
+                datetime(2026, 7, 25, tzinfo=UTC),
+                datetime(2026, 7, 25, 1, tzinfo=UTC),
+                "test-feed",
+                "record-z",
+            ),
+            (
+                datetime(2026, 7, 25, tzinfo=UTC),
+                datetime(2026, 7, 25, 1, tzinfo=UTC),
+                "test-feed",
+                "record-a",
+            ),
+            id="source-record-id-final-tie-breaker",
+        ),
+    ],
+)
+def test_latest_revision_uses_complete_precedence_order(
+    winner_metadata: tuple[datetime, datetime, str, str],
+    conflicting_metadata: tuple[datetime, datetime, str, str],
+) -> None:
+    store = PointInTimeStore()
+    winner_available_at, winner_ingested_at, winner_source, winner_record_id = (
+        winner_metadata
+    )
+    (
+        conflicting_available_at,
+        conflicting_ingested_at,
+        conflicting_source,
+        conflicting_record_id,
+    ) = conflicting_metadata
+    winner = make_bar(close=Decimal("334.00"), available_at=winner_available_at)
+    conflicting = make_bar(
+        close=Decimal("333.00"), available_at=conflicting_available_at
+    )
+    store.append_bar(
+        conflicting,
+        ingested_at=conflicting_ingested_at,
+        source=conflicting_source,
+        source_record_id=conflicting_record_id,
+    )
+    store.append_bar(
+        winner,
+        ingested_at=winner_ingested_at,
+        source=winner_source,
+        source_record_id=winner_record_id,
+    )
+    query = {
+        "market": Market.US,
+        "symbol": "AAPL",
+        "session_date": date(2026, 7, 24),
+        "as_of": datetime(2026, 7, 26, tzinfo=UTC),
+    }
+
+    revision = store.latest_bar_revision_as_of(**query)
+
+    assert revision == SelectedBarRevision(
+        bar=winner,
+        ingested_at=winner_ingested_at,
+        source=winner_source,
+        source_record_id=winner_record_id,
+    )
+    assert store.latest_bar_as_of(**query) == winner
+
+
+def test_latest_revision_filters_session_date_before_ranking() -> None:
+    store = PointInTimeStore()
+    target = make_bar(
+        close=Decimal("333.00"),
+        available_at=datetime(2026, 7, 25, tzinfo=UTC),
+    )
+    other_session = make_bar(
+        session_date=date(2026, 7, 25),
+        open=Decimal("998.00"),
+        high=Decimal("1000.00"),
+        low=Decimal("997.00"),
+        close=Decimal("999.00"),
+        available_at=datetime(2026, 7, 26, tzinfo=UTC),
+    )
+    store.append_bar(
+        target,
+        ingested_at=datetime(2026, 7, 25, 1, tzinfo=UTC),
+        source="alpha-feed",
+        source_record_id="record-a",
+    )
+    store.append_bar(
+        other_session,
+        ingested_at=datetime(2026, 7, 26, 1, tzinfo=UTC),
+        source="zulu-feed",
+        source_record_id="record-z",
+    )
+    query = {
+        "market": Market.US,
+        "symbol": "AAPL",
+        "session_date": date(2026, 7, 24),
+        "as_of": datetime(2026, 7, 27, tzinfo=UTC),
+    }
+
+    revision = store.latest_bar_revision_as_of(**query)
+
+    assert revision == SelectedBarRevision(
+        bar=target,
+        ingested_at=datetime(2026, 7, 25, 1, tzinfo=UTC),
+        source="alpha-feed",
+        source_record_id="record-a",
+    )
+    assert store.latest_bar_as_of(**query) == target
+
+
 def test_latest_revision_uses_source_record_id_as_final_tie_breaker() -> None:
     store = PointInTimeStore()
     ingested_at = datetime(2026, 7, 25, 1, tzinfo=UTC)
