@@ -339,6 +339,35 @@ def test_fill_ids_are_globally_unique_across_batches() -> None:
     assert state(value) == before
 
 
+@pytest.mark.parametrize(
+    "replacement_fill",
+    [
+        fill("same", "AAPL", Side.BUY, "1", "10"),
+        fill("same", "MSFT", Side.BUY, "2", "20", "1"),
+    ],
+)
+def test_fill_id_cannot_be_reused_after_its_batch_is_reversed(
+    replacement_fill: BookedFill,
+) -> None:
+    value = ledger()
+    value.append(
+        batch(
+            "original",
+            1,
+            (fill("same", "AAPL", Side.BUY, "1", "10"),),
+            (mark("AAPL", "10"),),
+        )
+    )
+    value.append(reverse("original", "reverse-original", 2))
+    before = state(value)
+    replacement_mark = mark(replacement_fill.symbol, str(replacement_fill.price))
+
+    with pytest.raises(ValueError, match=r"^fill_id must be globally unique$"):
+        value.append(batch("replacement", 3, (replacement_fill,), (replacement_mark,)))
+
+    assert state(value) == before
+
+
 def test_portfolio_mark_is_atomic_complete_and_supports_all_cash() -> None:
     cash_only = ledger()
     cash_only.append(close("cash-close", 1, ()))
@@ -430,6 +459,28 @@ def test_append_many_contract_empty_noop_and_atomic_failure() -> None:
 
 class PortfolioMarkedChild(PortfolioMarked):
     pass
+
+
+class CashInitializedChild(CashInitialized):
+    pass
+
+
+def test_append_accepts_legacy_subclass_without_weakening_append_many_contract() -> None:
+    value = PortfolioLedger("account-1", Market.US)
+    legacy = CashInitializedChild(**common("init", 0), amount=Decimal("1000"))
+
+    value.append(legacy)
+
+    assert value.events == (legacy,)
+    assert value.cash == Decimal("1000")
+    before = state(value)
+    with pytest.raises(TypeError, match="events must contain exact LedgerEvent values"):
+        value.append_many((legacy,))
+    assert state(value) == before
+
+    closing_mark = close("close", 1, ())
+    value.append_many((closing_mark,))
+    assert value.events == (legacy, closing_mark)
 
 
 def test_append_many_rejects_event_subclasses_duplicate_ids_and_time_atomically() -> None:

@@ -418,7 +418,9 @@ class PortfolioLedger:
             raise ValueError("decimal arithmetic failed") from error
 
     def append(self, event: LedgerEvent) -> None:
-        self.append_many((event,))
+        if not isinstance(event, _LEDGER_EVENT_TYPES):
+            raise TypeError("event must be a LedgerEvent")
+        self._commit_candidates((event,))
 
     def append_many(self, events: tuple[LedgerEvent, ...]) -> None:
         if type(events) is not tuple:
@@ -428,6 +430,9 @@ class PortfolioLedger:
         if any(type(event) not in _LEDGER_EVENT_TYPES for event in events):
             raise TypeError("events must contain exact LedgerEvent values")
 
+        self._commit_candidates(events)
+
+    def _commit_candidates(self, events: tuple[LedgerEvent, ...]) -> None:
         for event in events:
             if type(event) in (OpenExecutionBatchBooked, PortfolioMarked):
                 type(event).model_validate(event)
@@ -435,9 +440,9 @@ class PortfolioLedger:
                 raise ValueError("event account and market must match the ledger")
 
         candidate = (*self._events, *events)
-        if type(candidate[0]) is not CashInitialized:
+        if not isinstance(candidate[0], CashInitialized):
             raise ValueError("the first event must be CashInitialized")
-        if sum(type(event) is CashInitialized for event in candidate) != 1:
+        if sum(isinstance(event, CashInitialized) for event in candidate) != 1:
             raise ValueError("CashInitialized can only occur once")
 
         event_ids = tuple(event.event_id for event in candidate)
@@ -446,6 +451,15 @@ class PortfolioLedger:
         for previous, current in pairwise(candidate):
             if _utc_instant(current.occurred_at) <= _utc_instant(previous.occurred_at):
                 raise ValueError("occurred_at must be strictly increasing")
+
+        fill_ids = tuple(
+            fill.fill_id
+            for event in candidate
+            if isinstance(event, OpenExecutionBatchBooked)
+            for fill in event.fills
+        )
+        if len(fill_ids) != len(set(fill_ids)):
+            raise ValueError("fill_id must be globally unique")
 
         try:
             active_events = self._active_events(candidate)
