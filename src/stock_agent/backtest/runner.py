@@ -1,7 +1,24 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal, localcontext
+from decimal import (
+    MAX_EMAX,
+    MAX_PREC,
+    MIN_EMIN,
+    ROUND_HALF_EVEN,
+    Clamped,
+    Context,
+    Decimal,
+    DivisionByZero,
+    FloatOperation,
+    Inexact,
+    InvalidOperation,
+    Overflow,
+    Rounded,
+    Subnormal,
+    Underflow,
+    localcontext,
+)
 from typing import TypeVar
 
 from pydantic import BaseModel
@@ -34,6 +51,35 @@ from stock_agent.strategies import MarketSnapshot, Strategy, StrategyContext
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _PIT_POLICY = "business-available-at/v1"
+
+
+def _arithmetic_context_for(*values: Decimal) -> Context:
+    if any(not value.is_finite() for value in values):
+        raise ValueError("runner arithmetic values must be finite")
+    tuples = tuple(value.as_tuple() for value in values)
+    nonzero_exponents: list[int] = []
+    for value, value_tuple in zip(values, tuples, strict=True):
+        if not isinstance(value_tuple.exponent, int):
+            raise ValueError("runner arithmetic values must be finite")
+        if value:
+            nonzero_exponents.append(value_tuple.exponent)
+    highest_adjusted = max((value.adjusted() for value in values if value), default=0)
+    lowest_exponent = min(nonzero_exponents, default=0)
+    span = highest_adjusted - lowest_exponent + 1
+    coefficient_digits = sum(max(1, len(value_tuple.digits)) for value_tuple in tuples)
+    context = Context(
+        prec=min(MAX_PREC, max(128, span + 32, coefficient_digits + 32)),
+        rounding=ROUND_HALF_EVEN,
+        Emin=MIN_EMIN,
+        Emax=MAX_EMAX,
+        capitals=1,
+        clamp=0,
+        flags=[],
+        traps=[InvalidOperation, DivisionByZero, Overflow],
+    )
+    for signal in (Clamped, FloatOperation, Inexact, Rounded, Subnormal, Underflow):
+        context.traps[signal] = False
+    return context
 
 
 def _model_values(model: BaseModel) -> dict[str, object]:
@@ -112,7 +158,7 @@ def _event_id(run_id: str, *fields: object) -> str:
     return tagged_sha256("ledger-event", (run_id, *fields))
 
 
-class BacktestRunner:
+class ChronologicalBacktestRunner:
     def __init__(
         self,
         *,
@@ -146,6 +192,17 @@ class BacktestRunner:
 
     def run(self, spec: BacktestSpec) -> BacktestResult:
         clean_spec = _rebuild_exact(spec, BacktestSpec, "spec")
+        arithmetic_values = [self._transaction_cost_bps, clean_spec.initial_cash]
+        arithmetic_values.extend(
+            value
+            for session in clean_spec.sessions
+            for bar in session.open_bars
+            for value in (bar.open, bar.high, bar.low, bar.close, bar.volume)
+        )
+        with localcontext(_arithmetic_context_for(*arithmetic_values)):
+            return self._run_isolated(clean_spec)
+
+    def _run_isolated(self, clean_spec: BacktestSpec) -> BacktestResult:
         calendar_slice = self._validate_spec(clean_spec)
         manifest = BacktestInputManifest(
             account_id=clean_spec.account_id,
@@ -373,14 +430,14 @@ class BacktestRunner:
     def _new_position_notional(
         fills: tuple[Fill, ...], pre_open_symbols: set[str]
     ) -> Decimal:
-        with localcontext() as context:
-            context.prec = max(context.prec, 256)
-            total = Decimal(0)
-            for fill in fills:
-                if fill.side is Side.BUY and fill.symbol not in pre_open_symbols:
-                    assert fill.price is not None
-                    total += fill.filled_quantity * fill.price
-            return total
+        total = Decimal(0)
+        for fill in fills:
+            if fill.side is Side.BUY and fill.symbol not in pre_open_symbols:
+                assert fill.price is not None
+                product_context = _arithmetic_context_for(fill.filled_quantity, fill.price)
+                notional = product_context.multiply(fill.filled_quantity, fill.price)
+                total = _arithmetic_context_for(total, notional).add(total, notional)
+        return total
 
     @staticmethod
     def _book_open_batch(
@@ -391,37 +448,40 @@ class BacktestRunner:
         filled: tuple[Fill, ...],
     ) -> None:
         quantities: dict[str, Decimal] = {}
-        with localcontext() as context:
-            context.prec = max(context.prec, 256)
-            for lot in ledger.lots:
-                quantities[lot.symbol] = (
-                    quantities.get(lot.symbol, Decimal(0)) + lot.quantity
-                )
-            booked: list[BookedFill] = []
-            for fill in filled:
-                assert fill.price is not None
-                quantity = fill.filled_quantity
-                quantities[fill.symbol] = quantities.get(fill.symbol, Decimal(0)) + (
-                    quantity if fill.side is Side.BUY else -quantity
-                )
-                booked.append(
-                    BookedFill(
-                        fill_id=tagged_sha256(
+        for lot in ledger.lots:
+            current = quantities.get(lot.symbol, Decimal(0))
+            quantities[lot.symbol] = _arithmetic_context_for(current, lot.quantity).add(
+                current, lot.quantity
+            )
+        booked: list[BookedFill] = []
+        for fill in filled:
+            assert fill.price is not None
+            quantity = fill.filled_quantity
+            current = quantities.get(fill.symbol, Decimal(0))
+            arithmetic = _arithmetic_context_for(current, quantity)
+            quantities[fill.symbol] = (
+                arithmetic.add(current, quantity)
+                if fill.side is Side.BUY
+                else arithmetic.subtract(current, quantity)
+            )
+            booked.append(
+                BookedFill(
+                    fill_id=tagged_sha256(
+                        "booked-fill",
+                        (
+                            spec.run_id,
+                            session.session_date.isoformat(),
+                            fill.order_id,
                             "booked-fill",
-                            (
-                                spec.run_id,
-                                session.session_date.isoformat(),
-                                fill.order_id,
-                                "booked-fill",
-                            ),
                         ),
-                        symbol=fill.symbol,
-                        side=fill.side,
-                        quantity=quantity,
-                        price=fill.price,
-                        fees=fill.fees,
-                    )
+                    ),
+                    symbol=fill.symbol,
+                    side=fill.side,
+                    quantity=quantity,
+                    price=fill.price,
+                    fees=fill.fees,
                 )
+            )
         open_prices = {item.symbol: item.open for item in session.open_bars}
         held_symbols = tuple(
             sorted(symbol for symbol, quantity in quantities.items() if quantity > 0)

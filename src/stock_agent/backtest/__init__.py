@@ -9,14 +9,14 @@ from stock_agent.backtest.models import (
     SessionResult,
 )
 from stock_agent.backtest.planning import plan_orders, record_submission
-from stock_agent.backtest.runner import BacktestRunner
+from stock_agent.backtest.runner import ChronologicalBacktestRunner
 
 __all__ = [
     "BacktestInputManifest",
     "BacktestResult",
-    "BacktestRunner",
     "BacktestSession",
     "BacktestSpec",
+    "ChronologicalBacktestRunner",
     "OrderPlan",
     "OrderPlanSource",
     "OrderPlanStatus",

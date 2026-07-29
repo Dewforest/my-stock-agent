@@ -1,13 +1,13 @@
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal, Inexact, getcontext, localcontext
 
 from stock_agent.account import (
     CashInitialized,
     OpenExecutionBatchBooked,
     PortfolioMarked,
 )
-from stock_agent.backtest import BacktestRunner, BacktestSession, BacktestSpec
+from stock_agent.backtest import BacktestSession, BacktestSpec, ChronologicalBacktestRunner
 from stock_agent.data import PointInTimeStore
 from stock_agent.domain import Bar, Currency, Instrument, Market, Side, StrategyIntent
 from stock_agent.execution import FillStatus
@@ -126,9 +126,23 @@ def _fixture() -> tuple[PointInTimeStore, TradingCalendar, BacktestSpec]:
     return store, calendar, spec
 
 
+def _decimal_context_signature() -> tuple[object, ...]:
+    context = getcontext()
+    return (
+        context.prec,
+        context.rounding,
+        context.Emin,
+        context.Emax,
+        context.capitals,
+        context.clamp,
+        tuple(context.flags.items()),
+        tuple(context.traps.items()),
+    )
+
+
 def test_five_session_us_vertical_is_chronological_auditable_and_deterministic() -> None:
     store, calendar, spec = _fixture()
-    runner = BacktestRunner(
+    runner = ChronologicalBacktestRunner(
         store=store,
         calendar=calendar,
         strategy=ScriptedStrategy(),
@@ -187,7 +201,7 @@ def test_five_session_us_vertical_is_chronological_auditable_and_deterministic()
     assert len(result.resolved_data_fingerprint) == len("resolved-data-sha256:") + 64
 
     second_store, second_calendar, second_spec = _fixture()
-    second = BacktestRunner(
+    second = ChronologicalBacktestRunner(
         store=second_store,
         calendar=second_calendar,
         strategy=ScriptedStrategy(),
@@ -219,3 +233,39 @@ def test_five_session_us_vertical_is_chronological_auditable_and_deterministic()
 
     store.close()
     second_store.close()
+
+
+def test_five_session_run_is_isolated_from_hostile_decimal_context() -> None:
+    expected_store, expected_calendar, expected_spec = _fixture()
+    hostile_store, hostile_calendar, hostile_spec = _fixture()
+    expected_runner = ChronologicalBacktestRunner(
+        store=expected_store,
+        calendar=expected_calendar,
+        strategy=ScriptedStrategy(),
+        risk_engine=RiskEngine(),
+        transaction_cost_bps=Decimal("10"),
+    )
+    hostile_runner = ChronologicalBacktestRunner(
+        store=hostile_store,
+        calendar=hostile_calendar,
+        strategy=ScriptedStrategy(),
+        risk_engine=RiskEngine(),
+        transaction_cost_bps=Decimal("10"),
+    )
+    expected = expected_runner.run(expected_spec)
+
+    with localcontext() as hostile:
+        hostile.prec = 1
+        hostile.rounding = ROUND_UP
+        hostile.Emin = 0
+        hostile.Emax = 0
+        hostile.traps[Inexact] = True
+        signature = _decimal_context_signature()
+
+        actual = hostile_runner.run(hostile_spec)
+
+        assert actual == expected
+        assert _decimal_context_signature() == signature
+
+    expected_store.close()
+    hostile_store.close()
