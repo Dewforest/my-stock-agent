@@ -28,7 +28,7 @@ Add tests for:
 - fixed-field compact JSON UTF-8 encoding;
 - tagged SHA-256 lowercase output;
 - hostile ambient Decimal context isolation;
-- the existing fixture evidence ID remains exactly `bar-sha256:481d5c3e8ceff71f4fc65db6cede2fdc79727edf011373e03be1e84ce8284b4`.
+- the existing fixture evidence ID remains exactly `bar-sha256:481d5c3e8ceff71f4fc65db6cede2fdc79727edf011373e03be1e84ce8284b4e`.
 
 Run:
 
