@@ -565,7 +565,7 @@ git commit -m "feat: enforce shared portfolio risk limits"
 
 ### Task 9: Define the strategy protocol and deterministic fixture strategy
 
-**Objective:** Prove that all future A/B/C/D/F adapters can share one strategy boundary.
+**Objective:** Prove the version-1 bars-only boundary for the Phase 1 fixture while preserving an isolation contract that later versioned A/B/C/D/F adapters can evolve.
 
 **Files:**
 - Create: `src/stock_agent/strategies/__init__.py`
@@ -656,10 +656,16 @@ For each session in order:
 3. construct the PIT market and portfolio snapshots
 4. call the strategy after close
 5. pass intents through risk
-6. queue approved orders for the next session
+6. convert approved target weights to order deltas, then queue executable orders for the next session
 7. record NAV and audit events
 
 Do not add parallelism in Phase 1.
+
+The target-to-order boundary is explicit: `HOLD` and zero delta produce no order;
+`REDUCE` produces a SELL for the reduction delta; `BUY` requires a positive delta;
+`SELL` targets zero. Reject a side/target delta inconsistency rather than silently
+reversing its direction. Pass each session's complete ordered intent tuple through
+`RiskEngine.evaluate_many` once before conversion.
 
 **Step 4: Verify focused and full suite**
 
