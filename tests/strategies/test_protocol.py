@@ -373,6 +373,31 @@ def test_strategy_context_rejects_position_subclasses() -> None:
         StrategyContext(**context_values(portfolio=nested))
 
 
+@pytest.mark.parametrize("subclass_first", [False, True])
+def test_strategy_context_rejects_mixed_exact_and_subclass_positions(
+    subclass_first: bool,
+) -> None:
+    class MutablePosition(Position):
+        model_config = ConfigDict(frozen=False)
+
+    exact = Position(
+        symbol="MSFT",
+        quantity=Decimal("1"),
+        average_cost=Decimal("100"),
+        market_value=Decimal("100"),
+    )
+    mutable = MutablePosition(**position().model_dump())
+    positions = (mutable, exact) if subclass_first else (exact, mutable)
+    original = portfolio()
+    values = {name: getattr(original, name) for name in PortfolioSnapshot.model_fields}
+    values["positions"] = positions
+    values["nav"] = values["peak_nav"] = Decimal("1200")
+    polluted = PortfolioSnapshot.model_construct(**values)
+
+    with pytest.raises(ValidationError):
+        StrategyContext(**context_values(portfolio=polluted))
+
+
 def test_strategy_context_cannot_be_built_from_copy_updated_position() -> None:
     with pytest.raises(TypeError):
         StrategyContext(

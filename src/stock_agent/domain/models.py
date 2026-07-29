@@ -10,7 +10,6 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
-    ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
 )
@@ -125,16 +124,14 @@ class PortfolioSnapshot(_ImmutableModel):
     positions: tuple[Position, ...] = ()
     as_of: AwareDatetime
 
-    @field_validator("positions", mode="wrap")
+    @field_validator("positions", mode="before")
     @classmethod
-    def preserve_position_subclasses_for_boundary_rejection(
-        cls, value: object, handler: ValidatorFunctionWrapHandler
-    ) -> object:
-        if type(value) is tuple and value and all(
+    def positions_have_no_position_subclasses(cls, value: object) -> object:
+        if type(value) is tuple and any(
             isinstance(item, Position) and type(item) is not Position for item in value
         ):
-            return value
-        return handler(value)
+            raise ValueError("positions must contain exact Position values")
+        return value
 
     @model_validator(mode="after")
     def portfolio_is_consistent(self) -> Self:

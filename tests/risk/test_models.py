@@ -103,10 +103,10 @@ def test_risk_context_rejects_mutable_position_subclasses_nested_in_portfolio() 
         average_cost=Decimal("100"),
         market_value=Decimal("0"),
     )
-    portfolio = PortfolioSnapshot(
-        **full_cash_portfolio().model_dump(exclude={"positions"}),
-        positions=(position,),
-    )
+    original = full_cash_portfolio()
+    values = {name: getattr(original, name) for name in PortfolioSnapshot.model_fields}
+    values["positions"] = (position,)
+    portfolio = PortfolioSnapshot.model_construct(**values)
 
     position.market_value = Decimal("1")
     assert portfolio.positions[0].market_value == Decimal("1")

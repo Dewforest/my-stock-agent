@@ -3,7 +3,7 @@ from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 
 import pytest
-from pydantic import ValidationError
+from pydantic import ConfigDict, ValidationError
 
 import stock_agent.domain as domain
 from stock_agent.domain.models import (
@@ -520,6 +520,30 @@ def test_portfolio_snapshot_positions_are_an_immutable_tuple() -> None:
 
     with pytest.raises(ValidationError):
         snapshot.cash = Decimal("500")
+
+
+@pytest.mark.parametrize("ordering", ["exact-first", "subclass-first", "subclass-only"])
+def test_portfolio_snapshot_rejects_position_subclasses_without_mutating_legal_snapshots(
+    ordering: str,
+) -> None:
+    class MutablePosition(Position):
+        model_config = ConfigDict(frozen=False)
+
+    exact = make_position(symbol="MSFT", market_value=Decimal("950"))
+    mutable = MutablePosition(**make_position().model_dump())
+    positions = {
+        "exact-first": (exact, mutable),
+        "subclass-first": (mutable, exact),
+        "subclass-only": (mutable,),
+    }[ordering]
+    legal = make_snapshot(positions=(exact,))
+
+    with pytest.raises(ValidationError):
+        make_snapshot(positions=positions)
+
+    mutable.market_value = Decimal("1")
+    assert legal.positions == (exact,)
+    assert legal.nav == Decimal("1950")
 
 
 def test_portfolio_snapshot_defaults_to_empty_positions() -> None:
