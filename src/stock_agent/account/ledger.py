@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from decimal import (
     ROUND_HALF_EVEN,
@@ -10,7 +11,8 @@ from decimal import (
     Underflow,
     localcontext,
 )
-from typing import Annotated, Self
+from itertools import pairwise
+from typing import Annotated, Any, Self
 
 from pydantic import (
     AwareDatetime,
@@ -23,7 +25,7 @@ from pydantic import (
     model_validator,
 )
 
-from stock_agent.domain import Market, PortfolioSnapshot, Position
+from stock_agent.domain import Market, PortfolioSnapshot, Position, Side
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 Symbol = Annotated[
@@ -76,6 +78,65 @@ def _validate_finite_decimal(value: object) -> Decimal:
 LotPositiveDecimal = Annotated[
     Decimal, BeforeValidator(_validate_finite_decimal), Field(gt=0)
 ]
+
+
+class _CopySafeMixin:
+    def copy(
+        self,
+        *,
+        include: Any = None,
+        exclude: Any = None,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update:
+            raise TypeError("immutable ledger models do not support copy updates")
+        return super().copy(  # type: ignore[misc]
+            include=include,
+            exclude=exclude,
+            update=update,
+            deep=deep,
+        )
+
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        if update:
+            raise TypeError("immutable ledger models do not support copy updates")
+        return super().model_copy(update=update, deep=deep)  # type: ignore[misc]
+
+
+class PositionMark(_CopySafeMixin, BaseModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        revalidate_instances="always",
+    )
+
+    symbol: Symbol
+    price: PositiveDecimal
+
+
+class BookedFill(_CopySafeMixin, BaseModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        revalidate_instances="always",
+    )
+
+    fill_id: NonEmptyStr
+    symbol: Symbol
+    side: Side
+    quantity: PositiveDecimal
+    price: PositiveDecimal
+    fees: NonNegativeDecimal
+
+    @field_validator("side", mode="before")
+    @classmethod
+    def side_is_executable(cls, value: object) -> object:
+        if type(value) is not Side or value not in (Side.BUY, Side.SELL):
+            raise ValueError("side must be exactly Side.BUY or Side.SELL")
+        return value
 
 
 class AcquisitionLot(BaseModel):
@@ -143,6 +204,70 @@ class PositionMarked(_LedgerEvent):
         return value
 
 
+class _CompleteValuationEvent(_CopySafeMixin, _LedgerEvent):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        revalidate_instances="always",
+    )
+
+    session_date: date
+    marks: tuple[PositionMark, ...]
+
+    @field_validator("session_date", mode="before")
+    @classmethod
+    def session_date_is_plain_date(cls, value: object) -> object:
+        if type(value) is not date:
+            raise ValueError("session_date must be a plain date")
+        return value
+
+    @field_validator("marks", mode="before")
+    @classmethod
+    def marks_are_exact_tuple(cls, value: object) -> object:
+        if type(value) is not tuple:
+            raise ValueError("marks must be a tuple")
+        if any(type(item) is not PositionMark for item in value):
+            raise ValueError("marks must contain exact PositionMark values")
+        return value
+
+    @field_validator("marks")
+    @classmethod
+    def marks_are_canonical(cls, value: tuple[PositionMark, ...]) -> tuple[PositionMark, ...]:
+        symbols = tuple(item.symbol for item in value)
+        if symbols != tuple(sorted(symbols)):
+            raise ValueError("marks must be sorted by symbol")
+        if len(symbols) != len(set(symbols)):
+            raise ValueError("mark symbols must be unique")
+        return value
+
+
+class OpenExecutionBatchBooked(_CompleteValuationEvent):
+    fills: tuple[BookedFill, ...]
+
+    @field_validator("fills", mode="before")
+    @classmethod
+    def fills_are_exact_nonempty_tuple(cls, value: object) -> object:
+        if type(value) is not tuple:
+            raise ValueError("fills must be a tuple")
+        if not value:
+            raise ValueError("fills must not be empty")
+        if any(type(item) is not BookedFill for item in value):
+            raise ValueError("fills must contain exact BookedFill values")
+        return value
+
+    @field_validator("fills")
+    @classmethod
+    def fill_ids_are_unique(cls, value: tuple[BookedFill, ...]) -> tuple[BookedFill, ...]:
+        fill_ids = tuple(item.fill_id for item in value)
+        if len(fill_ids) != len(set(fill_ids)):
+            raise ValueError("fill_id must be unique within a batch")
+        return value
+
+
+class PortfolioMarked(_CompleteValuationEvent):
+    pass
+
+
 class CashAdjusted(_LedgerEvent):
     amount: SupportedDecimal
     reason: NonEmptyStr
@@ -167,7 +292,25 @@ class EventReversed(_LedgerEvent):
 
 
 LedgerEvent = (
-    CashInitialized | BuyFilled | SellFilled | CashAdjusted | PositionMarked | EventReversed
+    CashInitialized
+    | BuyFilled
+    | SellFilled
+    | CashAdjusted
+    | PositionMarked
+    | OpenExecutionBatchBooked
+    | PortfolioMarked
+    | EventReversed
+)
+
+_LEDGER_EVENT_TYPES = (
+    CashInitialized,
+    BuyFilled,
+    SellFilled,
+    CashAdjusted,
+    PositionMarked,
+    OpenExecutionBatchBooked,
+    PortfolioMarked,
+    EventReversed,
 )
 
 _ARITHMETIC_CONTEXT = Context(
@@ -275,29 +418,39 @@ class PortfolioLedger:
             raise ValueError("decimal arithmetic failed") from error
 
     def append(self, event: LedgerEvent) -> None:
-        if not isinstance(
-            event,
-            (CashInitialized, BuyFilled, SellFilled, CashAdjusted, PositionMarked, EventReversed),
-        ):
-            raise TypeError("event must be a LedgerEvent")
-        if event.account_id != self._account_id or event.market is not self._market:
-            raise ValueError("event account and market must match the ledger")
-        if not self._events and not isinstance(event, CashInitialized):
+        self.append_many((event,))
+
+    def append_many(self, events: tuple[LedgerEvent, ...]) -> None:
+        if type(events) is not tuple:
+            raise TypeError("events must be a tuple")
+        if not events:
+            return
+        if any(type(event) not in _LEDGER_EVENT_TYPES for event in events):
+            raise TypeError("events must contain exact LedgerEvent values")
+
+        for event in events:
+            if type(event) in (OpenExecutionBatchBooked, PortfolioMarked):
+                type(event).model_validate(event)
+            if event.account_id != self._account_id or event.market is not self._market:
+                raise ValueError("event account and market must match the ledger")
+
+        candidate = (*self._events, *events)
+        if type(candidate[0]) is not CashInitialized:
             raise ValueError("the first event must be CashInitialized")
-        if any(existing.event_id == event.event_id for existing in self._events):
-            raise ValueError("event_id must be unique")
-        if self._events and _utc_instant(event.occurred_at) <= _utc_instant(
-            self._events[-1].occurred_at
-        ):
-            raise ValueError("occurred_at must be strictly increasing")
-        if isinstance(event, CashInitialized) and self._events:
+        if sum(type(event) is CashInitialized for event in candidate) != 1:
             raise ValueError("CashInitialized can only occur once")
 
-        candidate = (*self._events, event)
+        event_ids = tuple(event.event_id for event in candidate)
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("event_id must be unique")
+        for previous, current in pairwise(candidate):
+            if _utc_instant(current.occurred_at) <= _utc_instant(previous.occurred_at):
+                raise ValueError("occurred_at must be strictly increasing")
+
         try:
             active_events = self._active_events(candidate)
             cash, realized_pnl, positions, lots, snapshot = self._replay(
-                active_events, snapshot_as_of=event.occurred_at
+                active_events, snapshot_as_of=events[-1].occurred_at
             )
         except DecimalException as error:
             raise ValueError("decimal arithmetic failed") from error
@@ -328,6 +481,7 @@ class PortfolioLedger:
         holdings: dict[str, _Holding] = {}
         positions: tuple[Position, ...] = ()
         snapshot: PortfolioSnapshot | None = None
+        booked_fill_ids: set[str] = set()
 
         for replayed in events:
             if isinstance(replayed, CashInitialized):
@@ -335,64 +489,28 @@ class PortfolioLedger:
                 peak_nav = replayed.amount
             elif isinstance(replayed, BuyFilled):
                 assert cash is not None
-                cost = context.add(
-                    context.multiply(replayed.quantity, replayed.price), replayed.fees
+                cash = self._apply_buy(
+                    holdings,
+                    cash,
+                    replayed.symbol,
+                    replayed.session_date,
+                    replayed.quantity,
+                    replayed.price,
+                    replayed.fees,
+                    context,
                 )
-                new_cash = context.subtract(cash, cost)
-                self._require_finite(cost, new_cash)
-                if cost > cash or new_cash < 0:
-                    raise ValueError("insufficient cash")
-                holding = holdings.get(replayed.symbol)
-                if holding is None:
-                    holdings[replayed.symbol] = _Holding(
-                        [_Lot(replayed.session_date, replayed.quantity, cost)], replayed.price
-                    )
-                else:
-                    holding.lots.append(_Lot(replayed.session_date, replayed.quantity, cost))
-                    holding.mark_price = replayed.price
-                cash = new_cash
             elif isinstance(replayed, SellFilled):
                 assert cash is not None
-                holding = holdings.get(replayed.symbol)
-                held_quantity = (
-                    Decimal(0)
-                    if holding is None
-                    else self._sum_lot_quantity(holding, context)
+                cash, realized_pnl = self._apply_sell(
+                    holdings,
+                    cash,
+                    realized_pnl,
+                    replayed.symbol,
+                    replayed.quantity,
+                    replayed.price,
+                    replayed.fees,
+                    context,
                 )
-                if holding is None or replayed.quantity > held_quantity:
-                    raise ValueError("cannot sell more than the held quantity")
-                proceeds = context.subtract(
-                    context.multiply(replayed.quantity, replayed.price), replayed.fees
-                )
-                self._require_finite(proceeds)
-                if proceeds < 0:
-                    raise ValueError("sell proceeds cannot be negative")
-                allocated_cost = Decimal(0)
-                remaining_to_sell = replayed.quantity
-                while remaining_to_sell > 0:
-                    lot = holding.lots[0]
-                    take = min(remaining_to_sell, lot.quantity)
-                    if take == lot.quantity:
-                        lot_cost = lot.cost_basis
-                        holding.lots.pop(0)
-                    else:
-                        old_quantity = lot.quantity
-                        lot_cost = context.divide(
-                            context.multiply(lot.cost_basis, take), old_quantity
-                        )
-                        lot.quantity = context.subtract(old_quantity, take)
-                        lot.cost_basis = context.subtract(lot.cost_basis, lot_cost)
-                    allocated_cost = context.add(allocated_cost, lot_cost)
-                    remaining_to_sell = context.subtract(remaining_to_sell, take)
-                cash = context.add(cash, proceeds)
-                realized_pnl = context.add(
-                    realized_pnl, context.subtract(proceeds, allocated_cost)
-                )
-                self._require_finite(allocated_cost, cash, realized_pnl)
-                if not holding.lots:
-                    del holdings[replayed.symbol]
-                else:
-                    holding.mark_price = replayed.price
             elif isinstance(replayed, CashAdjusted):
                 assert cash is not None
                 new_cash = context.add(cash, replayed.amount)
@@ -405,6 +523,37 @@ class PortfolioLedger:
                 if holding is None:
                     raise ValueError("cannot mark an unknown position")
                 holding.mark_price = replayed.price
+            elif isinstance(replayed, OpenExecutionBatchBooked):
+                assert cash is not None
+                for fill in replayed.fills:
+                    if fill.fill_id in booked_fill_ids:
+                        raise ValueError("fill_id must be globally unique")
+                    booked_fill_ids.add(fill.fill_id)
+                    if fill.side is Side.BUY:
+                        cash = self._apply_buy(
+                            holdings,
+                            cash,
+                            fill.symbol,
+                            replayed.session_date,
+                            fill.quantity,
+                            fill.price,
+                            fill.fees,
+                            context,
+                        )
+                    else:
+                        cash, realized_pnl = self._apply_sell(
+                            holdings,
+                            cash,
+                            realized_pnl,
+                            fill.symbol,
+                            fill.quantity,
+                            fill.price,
+                            fill.fees,
+                            context,
+                        )
+                self._apply_complete_marks(holdings, replayed.marks)
+            elif isinstance(replayed, PortfolioMarked):
+                self._apply_complete_marks(holdings, replayed.marks)
             else:
                 raise ValueError("event replay is not implemented")
 
@@ -412,6 +561,7 @@ class PortfolioLedger:
             market_value = Decimal(0)
             for position in positions:
                 market_value = context.add(market_value, position.market_value)
+            assert cash is not None
             nav = context.add(cash, market_value)
             self._require_finite(cash, realized_pnl, market_value, nav)
             assert peak_nav is not None
@@ -429,6 +579,87 @@ class PortfolioLedger:
 
         assert cash is not None and snapshot is not None
         return cash, realized_pnl, positions, self._public_lots(holdings), snapshot
+
+    @classmethod
+    def _apply_buy(
+        cls,
+        holdings: dict[str, _Holding],
+        cash: Decimal,
+        symbol: str,
+        session_date: date,
+        quantity: Decimal,
+        price: Decimal,
+        fees: Decimal,
+        context: Context,
+    ) -> Decimal:
+        cost = context.add(context.multiply(quantity, price), fees)
+        new_cash = context.subtract(cash, cost)
+        cls._require_finite(cost, new_cash)
+        if cost > cash or new_cash < 0:
+            raise ValueError("insufficient cash")
+        holding = holdings.get(symbol)
+        if holding is None:
+            holdings[symbol] = _Holding([_Lot(session_date, quantity, cost)], price)
+        else:
+            holding.lots.append(_Lot(session_date, quantity, cost))
+            holding.mark_price = price
+        return new_cash
+
+    @classmethod
+    def _apply_sell(
+        cls,
+        holdings: dict[str, _Holding],
+        cash: Decimal,
+        realized_pnl: Decimal,
+        symbol: str,
+        quantity: Decimal,
+        price: Decimal,
+        fees: Decimal,
+        context: Context,
+    ) -> tuple[Decimal, Decimal]:
+        holding = holdings.get(symbol)
+        held_quantity = Decimal(0) if holding is None else cls._sum_lot_quantity(holding, context)
+        if holding is None or quantity > held_quantity:
+            raise ValueError("cannot sell more than the held quantity")
+        proceeds = context.subtract(context.multiply(quantity, price), fees)
+        cls._require_finite(proceeds)
+        if proceeds < 0:
+            raise ValueError("sell proceeds cannot be negative")
+        allocated_cost = Decimal(0)
+        remaining_to_sell = quantity
+        while remaining_to_sell > 0:
+            lot = holding.lots[0]
+            take = min(remaining_to_sell, lot.quantity)
+            if take == lot.quantity:
+                lot_cost = lot.cost_basis
+                holding.lots.pop(0)
+            else:
+                old_quantity = lot.quantity
+                lot_cost = context.divide(context.multiply(lot.cost_basis, take), old_quantity)
+                lot.quantity = context.subtract(old_quantity, take)
+                lot.cost_basis = context.subtract(lot.cost_basis, lot_cost)
+            allocated_cost = context.add(allocated_cost, lot_cost)
+            remaining_to_sell = context.subtract(remaining_to_sell, take)
+        new_cash = context.add(cash, proceeds)
+        new_realized_pnl = context.add(
+            realized_pnl, context.subtract(proceeds, allocated_cost)
+        )
+        cls._require_finite(allocated_cost, new_cash, new_realized_pnl)
+        if not holding.lots:
+            del holdings[symbol]
+        else:
+            holding.mark_price = price
+        return new_cash, new_realized_pnl
+
+    @staticmethod
+    def _apply_complete_marks(
+        holdings: dict[str, _Holding], marks: tuple[PositionMark, ...]
+    ) -> None:
+        mark_symbols = tuple(mark.symbol for mark in marks)
+        if mark_symbols != tuple(sorted(holdings)):
+            raise ValueError("marks must exactly match the complete held-symbol set")
+        for mark in marks:
+            holdings[mark.symbol].mark_price = mark.price
 
     @staticmethod
     def _active_events(events: tuple[LedgerEvent, ...]) -> tuple[LedgerEvent, ...]:

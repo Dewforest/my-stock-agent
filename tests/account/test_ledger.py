@@ -549,5 +549,9 @@ def test_ledger_requires_strict_market(market: object) -> None:
 def test_public_export_includes_portfolio_ledger() -> None:
     assert "AcquisitionLot" in account.__all__
     assert account.AcquisitionLot is AcquisitionLot
+    assert "PositionMark" in account.__all__
+    assert "BookedFill" in account.__all__
+    assert "OpenExecutionBatchBooked" in account.__all__
+    assert "PortfolioMarked" in account.__all__
     assert account.__all__[-1] == "PortfolioLedger"
     assert account.PortfolioLedger is PortfolioLedger

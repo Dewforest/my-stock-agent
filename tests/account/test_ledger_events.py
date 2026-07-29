@@ -14,7 +14,9 @@ from stock_agent.account import (
     CashInitialized,
     EventReversed,
     LedgerEvent,
+    OpenExecutionBatchBooked,
     PortfolioLedger,
+    PortfolioMarked,
     PositionMarked,
     SellFilled,
 )
@@ -360,6 +362,8 @@ def test_ledger_event_is_exact_python_union() -> None:
         SellFilled,
         CashAdjusted,
         PositionMarked,
+        OpenExecutionBatchBooked,
+        PortfolioMarked,
         EventReversed,
     )
 
@@ -367,11 +371,15 @@ def test_ledger_event_is_exact_python_union() -> None:
 def test_account_exports_exact_public_contract() -> None:
     assert account.__all__ == [
         "AcquisitionLot",
+        "PositionMark",
+        "BookedFill",
         "CashInitialized",
         "BuyFilled",
         "SellFilled",
         "CashAdjusted",
         "PositionMarked",
+        "OpenExecutionBatchBooked",
+        "PortfolioMarked",
         "EventReversed",
         "LedgerEvent",
         "PortfolioLedger",
