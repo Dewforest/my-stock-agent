@@ -365,9 +365,27 @@ def test_domain_model_copies_remain_equal_and_frozen(deep: bool) -> None:
             setattr(copied, field, getattr(copied, field))
 
 
+@pytest.mark.parametrize("deep", [False, True])
+def test_deprecated_domain_model_copies_remain_equal_and_frozen(deep: bool) -> None:
+    for model in domain_model_instances():
+        with pytest.warns(DeprecationWarning):
+            copied = model.copy(deep=deep)
+
+        assert copied == model
+        field = next(iter(type(copied).model_fields))
+        with pytest.raises(ValidationError):
+            setattr(copied, field, getattr(copied, field))
+
+
 def test_domain_models_allow_empty_copy_updates() -> None:
     for model in domain_model_instances():
         assert model.model_copy(update={}) == model
+
+
+def test_domain_models_allow_empty_deprecated_copy_updates() -> None:
+    for model in domain_model_instances():
+        with pytest.warns(DeprecationWarning):
+            assert model.copy(update={}) == model
 
 
 def test_domain_models_reject_nonempty_copy_updates_without_mutating_source() -> None:
@@ -379,6 +397,14 @@ def test_domain_models_reject_nonempty_copy_updates_without_mutating_source() ->
             model.model_copy(update={field: getattr(model, field)})
 
         assert model.model_dump() == original
+
+
+def test_domain_models_reject_valid_and_invalid_deprecated_copy_updates() -> None:
+    for model in domain_model_instances():
+        field = next(iter(type(model).model_fields))
+        for value in (getattr(model, field), []):
+            with pytest.raises(TypeError):
+                model.copy(update={field: value})
 
 
 @pytest.mark.parametrize(

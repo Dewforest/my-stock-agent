@@ -217,6 +217,16 @@ def test_market_snapshot_cannot_be_built_from_copy_updated_bar() -> None:
         MarketSnapshot(**snapshot_values(bars=(bar().model_copy(update={"volume": []}),)))
 
 
+@pytest.mark.parametrize("field", ["volume", "available_at"])
+def test_market_snapshot_revalidates_constructed_bars(field: str) -> None:
+    values = {name: getattr(bar(), name) for name in Bar.model_fields}
+    values[field] = []
+    polluted = Bar.model_construct(**values)
+
+    with pytest.raises(ValidationError):
+        MarketSnapshot(**snapshot_values(bars=(polluted,)))
+
+
 def test_market_snapshot_is_frozen_transitively_and_forbids_extras() -> None:
     item = bar()
     snapshot = MarketSnapshot(**snapshot_values(bars=(item,)))
@@ -237,6 +247,29 @@ def test_market_snapshot_forbids_copy_updates() -> None:
         snapshot.model_copy(update={"market": Market.CN})
 
 
+def test_boundary_models_allow_empty_copy_updates() -> None:
+    boundary_models = (
+        MarketSnapshot(**snapshot_values()),
+        StrategyContext(**context_values()),
+    )
+    for model in boundary_models:
+        assert model.model_copy(update={}) == model
+        with pytest.warns(DeprecationWarning):
+            assert model.copy(update={}) == model
+
+
+def test_boundary_models_reject_nonempty_deprecated_copy_updates() -> None:
+    boundary_models = (
+        MarketSnapshot(**snapshot_values()),
+        StrategyContext(**context_values()),
+    )
+    for model in boundary_models:
+        field = next(iter(type(model).model_fields))
+        for value in (getattr(model, field), []):
+            with pytest.raises(TypeError):
+                model.copy(update={field: value})
+
+
 @pytest.mark.parametrize(
     "as_of",
     [
@@ -252,7 +285,8 @@ def test_strategy_context_accepts_matching_early_and_late_instants(as_of: dateti
         strategy_config_version="  version-1  ",
     )
 
-    assert context.market_snapshot is market_snapshot
+    assert context.market_snapshot == market_snapshot
+    assert context.market_snapshot is not market_snapshot
     assert context.portfolio.as_of == as_of
     assert context.strategy_config_version == "version-1"
 
@@ -330,7 +364,11 @@ def test_strategy_context_rejects_position_subclasses() -> None:
         model_config = ConfigDict(frozen=False)
 
     nested_position = MutablePosition(**position().model_dump())
-    nested = portfolio(positions=(nested_position,))
+    original = portfolio()
+    values = {name: getattr(original, name) for name in PortfolioSnapshot.model_fields}
+    values["positions"] = (nested_position,)
+    values["nav"] = values["peak_nav"] = Decimal("1100")
+    nested = PortfolioSnapshot.model_construct(**values)
     with pytest.raises(ValidationError):
         StrategyContext(**context_values(portfolio=nested))
 
@@ -342,6 +380,54 @@ def test_strategy_context_cannot_be_built_from_copy_updated_position() -> None:
                 portfolio=portfolio(positions=(position().model_copy(update={"average_cost": []}),))
             )
         )
+
+
+def test_portfolio_snapshot_revalidates_constructed_positions() -> None:
+    values = {name: getattr(position(), name) for name in Position.model_fields}
+    values["average_cost"] = []
+    polluted = Position.model_construct(**values)
+
+    with pytest.raises(ValidationError):
+        portfolio(positions=(polluted,))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("account_id", []), ("positions", [])],
+)
+def test_strategy_context_revalidates_constructed_portfolios(
+    field: str, value: object
+) -> None:
+    nested = portfolio()
+    values = {name: getattr(nested, name) for name in PortfolioSnapshot.model_fields}
+    values[field] = value
+    polluted = PortfolioSnapshot.model_construct(**values)
+
+    with pytest.raises(ValidationError):
+        StrategyContext(**context_values(portfolio=polluted))
+
+
+def test_strategy_context_revalidates_constructed_market_snapshot_collections() -> None:
+    nested = MarketSnapshot(**snapshot_values())
+    values = {name: getattr(nested, name) for name in MarketSnapshot.model_fields}
+    values["bars"] = []
+    polluted = MarketSnapshot.model_construct(**values)
+
+    with pytest.raises(ValidationError):
+        StrategyContext(**context_values(market_snapshot=polluted))
+
+
+def test_strategy_context_revalidates_constructed_market_snapshot_bars() -> None:
+    item = bar()
+    bar_values = {name: getattr(item, name) for name in Bar.model_fields}
+    bar_values["volume"] = []
+    polluted_bar = Bar.model_construct(**bar_values)
+    polluted_snapshot = MarketSnapshot.model_construct(
+        **snapshot_values(bars=(polluted_bar,))
+    )
+
+    with pytest.raises(ValidationError):
+        StrategyContext(**context_values(market_snapshot=polluted_snapshot))
 
 
 def test_strategy_context_is_frozen_transitively_and_forbids_extras() -> None:

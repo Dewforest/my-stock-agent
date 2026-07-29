@@ -10,6 +10,8 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    ValidatorFunctionWrapHandler,
+    field_validator,
     model_validator,
 )
 
@@ -24,12 +26,33 @@ PercentageInt = Annotated[int, Field(ge=0, le=100)]
 
 
 class _ImmutableModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        revalidate_instances="always",
+    )
+
+    def copy(
+        self,
+        *,
+        include: Any = None,
+        exclude: Any = None,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update:
+            raise TypeError("immutable domain models do not support copy updates")
+        return super().copy(
+            include=include,
+            exclude=exclude,
+            update=update,
+            deep=deep,
+        )
 
     def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
         if update:
             raise TypeError("immutable domain models do not support copy updates")
-        return super().model_copy(update=None, deep=deep)
+        return super().model_copy(update=update, deep=deep)
 
 
 class Market(StrEnum):
@@ -101,6 +124,17 @@ class PortfolioSnapshot(_ImmutableModel):
     peak_nav: StrictNonNegativeDecimal
     positions: tuple[Position, ...] = ()
     as_of: AwareDatetime
+
+    @field_validator("positions", mode="wrap")
+    @classmethod
+    def preserve_position_subclasses_for_boundary_rejection(
+        cls, value: object, handler: ValidatorFunctionWrapHandler
+    ) -> object:
+        if type(value) is tuple and value and all(
+            isinstance(item, Position) and type(item) is not Position for item in value
+        ):
+            return value
+        return handler(value)
 
     @model_validator(mode="after")
     def portfolio_is_consistent(self) -> Self:

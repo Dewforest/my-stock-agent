@@ -13,14 +13,36 @@ from stock_agent.domain import Bar, Market, PortfolioSnapshot, Position, Strateg
 
 
 class _ImmutableBoundaryModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        strict=True,
+        revalidate_instances="always",
+    )
+
+    def copy(
+        self,
+        *,
+        include: Any = None,
+        exclude: Any = None,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        if update:
+            raise TypeError("immutable strategy boundary models do not support copy updates")
+        return super().copy(
+            include=include,
+            exclude=exclude,
+            update=update,
+            deep=deep,
+        )
 
     def model_copy(
         self, *, update: Mapping[str, Any] | None = None, deep: bool = False
     ) -> Self:
-        if update is not None:
+        if update:
             raise TypeError("immutable strategy boundary models do not support copy updates")
-        return super().model_copy(update=None, deep=deep)
+        return super().model_copy(update=update, deep=deep)
 
 
 class MarketSnapshot(_ImmutableBoundaryModel):
