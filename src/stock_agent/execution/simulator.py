@@ -177,6 +177,7 @@ class ExecutionSimulator:
         bars: Iterable[Bar],
         session_states: Iterable[CnSessionState] = (),
         account_lots: Mapping[str, Iterable[AcquisitionLot]] | None = None,
+        available_cash_by_account: Mapping[str, Decimal] | None = None,
     ) -> tuple[Fill, ...]:
         self._require_plain_date(session_date, "session_date")
         calendar = self._calendars.get(market)
@@ -227,6 +228,52 @@ class ExecutionSimulator:
                 if any(not isinstance(lot, AcquisitionLot) for lot in materialized_lots):
                     raise TypeError("account_lots values must contain only AcquisitionLot values")
                 lots_by_account[normalized_account_id] = materialized_lots
+
+        remaining_cash: dict[str, Decimal] | None = None
+        if available_cash_by_account is not None:
+            if not isinstance(available_cash_by_account, Mapping):
+                raise TypeError("available_cash_by_account must be a mapping")
+            remaining_cash = {}
+            for account_id, cash in available_cash_by_account.items():
+                if not isinstance(account_id, str):
+                    raise TypeError("available_cash_by_account keys must be strings")
+                normalized_account_id = account_id.strip()
+                if not normalized_account_id:
+                    raise ValueError(
+                        "available_cash_by_account account id must be non-blank"
+                    )
+                if normalized_account_id in remaining_cash:
+                    raise ValueError(
+                        "duplicate normalized available_cash_by_account account id"
+                    )
+                if type(cash) is not Decimal:
+                    raise TypeError(
+                        "available_cash_by_account values must be exact Decimal values"
+                    )
+                if not cash.is_finite() or cash < 0:
+                    raise ValueError(
+                        "available_cash_by_account values must be finite and nonnegative"
+                    )
+                if not self._is_supported_decimal(cash):
+                    raise ValueError(
+                        "available_cash_by_account values have "
+                        f"{_UNSUPPORTED_NUMERIC_REASON}"
+                    )
+                remaining_cash[normalized_account_id] = cash
+
+            required_accounts = {
+                pending.intent.account_id
+                for pending in self._pending
+                if pending.intent.market is market
+                and session_date >= pending.eligible_session
+                and pending.intent.symbol in bars_by_symbol
+            }
+            missing_accounts = sorted(required_accounts - remaining_cash.keys())
+            if missing_accounts:
+                raise ValueError(
+                    "available_cash_by_account missing eligible account "
+                    f"{missing_accounts[0]}"
+                )
 
         processed_through = self._processed_through.get(market)
         if processed_through is not None and session_date < processed_through:
@@ -373,6 +420,58 @@ class ExecutionSimulator:
                 )
                 continue
 
+            if remaining_cash is not None:
+                try:
+                    cash_change = self._calculate_cash_change(
+                        pending.effective_quantity,
+                        bar.open,
+                        fees,
+                        intent.side,
+                    )
+                    if not self._is_supported_decimal(cash_change):
+                        raise ValueError
+                    if intent.side is Side.SELL:
+                        if cash_change < 0:
+                            fills.append(
+                                self._make_fill(
+                                    intent,
+                                    FillStatus.REJECTED,
+                                    requested_quantity=pending.effective_quantity,
+                                    reason="fees exceed sell proceeds",
+                                )
+                            )
+                            continue
+                        new_cash = self._add_cash(
+                            remaining_cash[intent.account_id], cash_change
+                        )
+                    else:
+                        if cash_change > remaining_cash[intent.account_id]:
+                            fills.append(
+                                self._make_fill(
+                                    intent,
+                                    FillStatus.REJECTED,
+                                    requested_quantity=pending.effective_quantity,
+                                    reason="insufficient available cash",
+                                )
+                            )
+                            continue
+                        new_cash = self._subtract_quantity(
+                            remaining_cash[intent.account_id], cash_change
+                        )
+                    if not self._is_supported_decimal(new_cash):
+                        raise ValueError
+                except (DecimalException, ValueError):
+                    fills.append(
+                        self._make_fill(
+                            intent,
+                            FillStatus.REJECTED,
+                            requested_quantity=pending.effective_quantity,
+                            reason=f"cash change has {_UNSUPPORTED_NUMERIC_REASON}",
+                        )
+                    )
+                    continue
+                remaining_cash[intent.account_id] = new_cash
+
             fills.append(
                 self._make_fill(
                     intent,
@@ -424,6 +523,37 @@ class ExecutionSimulator:
             context.multiply(context.multiply(quantity, price), bps), Decimal("10000")
         )
         return context.quantize(fee, _FEE_QUANTUM)
+
+    @staticmethod
+    def _calculate_cash_change(
+        quantity: Decimal, price: Decimal, fees: Decimal, side: Side
+    ) -> Decimal:
+        coefficient_digits = sum(
+            len(value.as_tuple().digits) for value in (quantity, price, fees)
+        )
+        context = Context(
+            prec=max(128, coefficient_digits + 16),
+            rounding=ROUND_HALF_EVEN,
+            Emin=-999999,
+            Emax=999999,
+        )
+        gross = context.multiply(quantity, price)
+        return (
+            context.subtract(gross, fees)
+            if side is Side.SELL
+            else context.add(gross, fees)
+        )
+
+    @staticmethod
+    def _add_cash(left: Decimal, right: Decimal) -> Decimal:
+        coefficient_digits = sum(len(value.as_tuple().digits) for value in (left, right))
+        context = Context(
+            prec=max(128, coefficient_digits + 4),
+            rounding=ROUND_HALF_EVEN,
+            Emin=-999999,
+            Emax=999999,
+        )
+        return context.add(left, right)
 
     @staticmethod
     def _subtract_quantity(left: Decimal, right: Decimal) -> Decimal:
