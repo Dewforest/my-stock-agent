@@ -95,6 +95,48 @@ def _rebuild_exact(value: object, expected: type[_ModelT], name: str) -> _ModelT
     return expected.model_validate(_model_values(value), strict=True)
 
 
+def _canonical_decimal_value(value: Decimal) -> Decimal:
+    return Decimal(canonical_decimal(value))
+
+
+def _canonical_bar(bar: Bar) -> Bar:
+    return Bar.model_validate(
+        {
+            **_model_values(bar),
+            "open": _canonical_decimal_value(bar.open),
+            "high": _canonical_decimal_value(bar.high),
+            "low": _canonical_decimal_value(bar.low),
+            "close": _canonical_decimal_value(bar.close),
+            "volume": _canonical_decimal_value(bar.volume),
+            "available_at": bar.available_at.astimezone(UTC),
+        },
+        strict=True,
+    )
+
+
+def _canonical_spec(spec: BacktestSpec) -> BacktestSpec:
+    sessions = tuple(
+        BacktestSession.model_validate(
+            {
+                **_model_values(session),
+                "open_at": session.open_at.astimezone(UTC),
+                "close_at": session.close_at.astimezone(UTC),
+                "open_bars": tuple(_canonical_bar(bar) for bar in session.open_bars),
+            },
+            strict=True,
+        )
+        for session in spec.sessions
+    )
+    return BacktestSpec.model_validate(
+        {
+            **_model_values(spec),
+            "initial_cash": _canonical_decimal_value(spec.initial_cash),
+            "sessions": sessions,
+        },
+        strict=True,
+    )
+
+
 def _bar_payload(bar: Bar) -> list[object]:
     return [
         bar.symbol,
@@ -188,10 +230,11 @@ class ChronologicalBacktestRunner:
         self._calendar = calendar
         self._strategy = strategy
         self._risk_engine = RiskEngine() if risk_engine is None else risk_engine
-        self._transaction_cost_bps = transaction_cost_bps
+        self._transaction_cost_bps = _canonical_decimal_value(transaction_cost_bps)
+        self._registry: dict[str, tuple[str, BacktestResult]] = {}
 
     def run(self, spec: BacktestSpec) -> BacktestResult:
-        clean_spec = _rebuild_exact(spec, BacktestSpec, "spec")
+        clean_spec = _canonical_spec(_rebuild_exact(spec, BacktestSpec, "spec"))
         arithmetic_values = [self._transaction_cost_bps, clean_spec.initial_cash]
         arithmetic_values.extend(
             value
@@ -217,6 +260,15 @@ class ChronologicalBacktestRunner:
             pit_knowledge_policy=_PIT_POLICY,
         )
         spec_fingerprint = tagged_sha256("backtest-spec", _manifest_payload(manifest))
+
+        cached = self._registry.get(clean_spec.run_id)
+        if cached is not None:
+            cached_fingerprint, cached_result = cached
+            if cached_fingerprint != spec_fingerprint:
+                raise ValueError(
+                    "run_id conflicts with a different backtest specification"
+                )
+            return cached_result
 
         ledger = PortfolioLedger(clean_spec.account_id, clean_spec.market)
         simulator = ExecutionSimulator(
@@ -383,7 +435,7 @@ class ChronologicalBacktestRunner:
         )
         resolved_fingerprint = tagged_sha256("resolved-data", revisions_payload)
         final_snapshot = session_results[-1].portfolio_snapshot
-        return BacktestResult(
+        result = BacktestResult(
             run_id=clean_spec.run_id,
             manifest=manifest,
             spec_fingerprint=spec_fingerprint,
@@ -394,6 +446,8 @@ class ChronologicalBacktestRunner:
             final_snapshot=final_snapshot,
             realized_pnl=ledger.realized_pnl,
         )
+        self._registry[clean_spec.run_id] = (spec_fingerprint, result)
+        return result
 
     def _validate_spec(self, spec: BacktestSpec) -> tuple[date, ...]:
         if spec.market is not self._calendar.market:

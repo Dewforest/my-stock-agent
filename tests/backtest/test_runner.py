@@ -16,6 +16,7 @@ from stock_agent.backtest import BacktestSession, BacktestSpec, ChronologicalBac
 from stock_agent.data import PointInTimeStore
 from stock_agent.domain import Bar, Currency, Instrument, Market, Side, StrategyIntent
 from stock_agent.execution import ExecutionSimulator, FillStatus
+from stock_agent.execution.cn_rules import CnPriceLimitState, CnSessionState
 from stock_agent.market import TradingCalendar
 from stock_agent.risk import RiskEngine
 from stock_agent.strategies import StrategyContext
@@ -843,4 +844,278 @@ def test_multiple_successful_fills_share_one_ordered_open_batch_with_complete_ma
     assert tuple(
         revision.bar.symbol for revision in result.sessions[1].selected_revisions
     ) == ("AAPL", "AAPL", "MSFT", "MSFT")
+    store.close()
+
+
+def test_successful_run_is_cached_before_store_strategy_and_execution_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, calendar, spec = _fixture()
+    strategy = CountingScriptedStrategy()
+    runner = ChronologicalBacktestRunner(
+        store=store,
+        calendar=calendar,
+        strategy=strategy,
+        transaction_cost_bps=Decimal("10.00"),
+    )
+    first = runner.run(spec)
+    original_fingerprint = first.resolved_data_fingerprint
+    correction_at = spec.sessions[-1].close_at + timedelta(seconds=1)
+    store.append_bar(
+        Bar(
+            symbol="AAPL",
+            market=Market.US,
+            session_date=DATES[0],
+            open=Decimal("999"),
+            high=Decimal("999"),
+            low=Decimal("999"),
+            close=Decimal("999"),
+            volume=Decimal("1000"),
+            available_at=correction_at,
+        ),
+        ingested_at=correction_at,
+        source="late-correction",
+        source_record_id="late-correction-d1",
+    )
+
+    def unexpected(*args: object, **kwargs: object) -> None:
+        raise AssertionError("cached run must not touch mutable dependencies")
+
+    monkeypatch.setattr(PointInTimeStore, "latest_bar_revision_as_of", unexpected)
+    monkeypatch.setattr(CountingScriptedStrategy, "evaluate", unexpected)
+    monkeypatch.setattr(runner_module, "ExecutionSimulator", unexpected)
+
+    second = runner.run(_spec_with(spec, initial_cash=Decimal("1000.000")))
+
+    assert second is first
+    assert second.resolved_data_fingerprint == original_fingerprint
+    assert second.sessions == first.sessions
+    store.close()
+
+
+def test_same_run_id_with_different_canonical_spec_conflicts_before_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, calendar, spec = _fixture()
+    runner = ChronologicalBacktestRunner(
+        store=store,
+        calendar=calendar,
+        strategy=ScriptedStrategy(),
+        transaction_cost_bps=Decimal("10"),
+    )
+    runner.run(spec)
+
+    def unexpected(*args: object, **kwargs: object) -> None:
+        raise AssertionError("conflict must precede mutable dependencies")
+
+    monkeypatch.setattr(PointInTimeStore, "latest_bar_revision_as_of", unexpected)
+    monkeypatch.setattr(ScriptedStrategy, "evaluate", unexpected)
+    monkeypatch.setattr(runner_module, "ExecutionSimulator", unexpected)
+
+    changed_open = _session_with(
+        spec.sessions[0],
+        open_bars=(
+            _bar(
+                DATES[0],
+                Decimal("101"),
+                at=spec.sessions[0].open_at,
+                volume=Decimal(0),
+            ),
+        ),
+    )
+    conflicting_specs = (
+        _spec_with(spec, initial_cash=Decimal("1001")),
+        _spec_with(spec, sessions=(changed_open, *spec.sessions[1:])),
+    )
+    for conflicting in conflicting_specs:
+        with pytest.raises(
+            ValueError,
+            match=r"^run_id conflicts with a different backtest specification$",
+        ):
+            runner.run(conflicting)
+
+    runner._transaction_cost_bps = Decimal("11")  # type: ignore[attr-defined]
+    with pytest.raises(
+        ValueError,
+        match=r"^run_id conflicts with a different backtest specification$",
+    ):
+        runner.run(spec)
+    store.close()
+
+
+def test_failed_run_is_not_cached_and_same_id_can_retry_after_dependency_arrives() -> None:
+    store, calendar, spec = _fixture(missing_close_dates=(DATES[0],))
+    runner = ChronologicalBacktestRunner(
+        store=store, calendar=calendar, strategy=CaseStrategy("empty")
+    )
+
+    with pytest.raises(
+        ValueError, match=f"missing point-in-time bar for AAPL on {DATES[0].isoformat()}"
+    ):
+        runner.run(spec)
+
+    close_at = spec.sessions[0].close_at
+    store.append_bar(
+        _bar(DATES[0], CLOSE_PRICES[0], at=close_at, volume=Decimal("1000")),
+        ingested_at=close_at + timedelta(seconds=1),
+        source="repaired",
+        source_record_id="repaired-d1",
+    )
+    result = runner.run(spec)
+
+    assert result.run_id == spec.run_id
+    assert len(result.sessions) == len(DATES)
+    store.close()
+
+
+def test_semantically_equivalent_specs_are_canonicalized_for_hashes_ids_and_json() -> None:
+    first_store, first_calendar, first_spec = _fixture()
+    second_store, second_calendar, second_spec = _fixture()
+    offset = timezone(timedelta(hours=5, minutes=30))
+
+    equivalent_sessions = tuple(
+        _session_with(
+            session,
+            open_at=session.open_at.astimezone(offset),
+            close_at=session.close_at.astimezone(offset),
+            open_bars=tuple(
+                Bar(
+                    symbol=bar.symbol,
+                    market=bar.market,
+                    session_date=bar.session_date,
+                    open=Decimal(f"{bar.open}.000"),
+                    high=Decimal(f"{bar.high}.000"),
+                    low=Decimal(f"{bar.low}.000"),
+                    close=Decimal(f"{bar.close}.000"),
+                    volume=Decimal("-0.000"),
+                    available_at=bar.available_at.astimezone(offset),
+                )
+                for bar in session.open_bars
+            ),
+        )
+        for session in second_spec.sessions
+    )
+    equivalent_spec = _spec_with(
+        second_spec,
+        initial_cash=Decimal("1000.0000"),
+        sessions=equivalent_sessions,
+    )
+    first = ChronologicalBacktestRunner(
+        store=first_store,
+        calendar=first_calendar,
+        strategy=ScriptedStrategy(),
+        transaction_cost_bps=Decimal("10"),
+    ).run(first_spec)
+    equivalent = ChronologicalBacktestRunner(
+        store=second_store,
+        calendar=second_calendar,
+        strategy=ScriptedStrategy(),
+        transaction_cost_bps=Decimal("10.000"),
+    ).run(equivalent_spec)
+
+    assert equivalent.spec_fingerprint == first.spec_fingerprint
+    assert equivalent.model_dump_json() == first.model_dump_json()
+
+    third_store, third_calendar, third_spec = _fixture()
+    different_run_id = ChronologicalBacktestRunner(
+        store=third_store,
+        calendar=third_calendar,
+        strategy=ScriptedStrategy(),
+        transaction_cost_bps=Decimal("10"),
+    ).run(_spec_with(third_spec, run_id="different-run-id"))
+    assert different_run_id.spec_fingerprint == first.spec_fingerprint
+
+    first_store.close()
+    second_store.close()
+    third_store.close()
+
+
+def test_same_run_id_with_changed_cn_state_conflicts_before_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates = DATES[:2]
+    instrument = Instrument(
+        symbol="600000",
+        market=Market.CN,
+        currency=Currency.CNY,
+        sector="Financials",
+    )
+
+    def cn_session(session_date: date, *, suspended: bool) -> BacktestSession:
+        open_at = _instant(session_date, 1)
+        return BacktestSession(
+            session_date=session_date,
+            open_at=open_at,
+            close_at=_instant(session_date, 7),
+            open_bars=(
+                Bar(
+                    symbol=instrument.symbol,
+                    market=Market.CN,
+                    session_date=session_date,
+                    open=Decimal("10"),
+                    high=Decimal("10"),
+                    low=Decimal("10"),
+                    close=Decimal("10"),
+                    volume=Decimal(0),
+                    available_at=open_at,
+                ),
+            ),
+            cn_session_states=(
+                CnSessionState(
+                    symbol=instrument.symbol,
+                    session_date=session_date,
+                    suspended=suspended,
+                    price_limit_state=CnPriceLimitState.NONE,
+                ),
+            ),
+        )
+
+    sessions = tuple(cn_session(item, suspended=False) for item in dates)
+    spec = BacktestSpec(
+        run_id="cn-conflict-run",
+        account_id="cn-account",
+        market=Market.CN,
+        initial_cash=Decimal("1000"),
+        instruments=(instrument,),
+        sessions=sessions,
+        strategy_config_version="v1",
+    )
+    store = PointInTimeStore()
+    for session in sessions:
+        store.append_bar(
+            Bar(
+                symbol=instrument.symbol,
+                market=Market.CN,
+                session_date=session.session_date,
+                open=Decimal("10"),
+                high=Decimal("10"),
+                low=Decimal("10"),
+                close=Decimal("10"),
+                volume=Decimal("1000"),
+                available_at=session.close_at,
+            ),
+            ingested_at=session.close_at,
+            source="cn-fixture",
+            source_record_id=f"cn-{session.session_date}",
+        )
+    runner = ChronologicalBacktestRunner(
+        store=store,
+        calendar=TradingCalendar(Market.CN, dates),
+        strategy=CaseStrategy("empty"),
+    )
+    runner.run(spec)
+
+    def unexpected(*args: object, **kwargs: object) -> None:
+        raise AssertionError("CN conflict must precede mutable dependencies")
+
+    monkeypatch.setattr(PointInTimeStore, "latest_bar_revision_as_of", unexpected)
+    monkeypatch.setattr(CaseStrategy, "evaluate", unexpected)
+    monkeypatch.setattr(runner_module, "ExecutionSimulator", unexpected)
+    changed_first = cn_session(dates[0], suspended=True)
+
+    with pytest.raises(
+        ValueError,
+        match=r"^run_id conflicts with a different backtest specification$",
+    ):
+        runner.run(_spec_with(spec, sessions=(changed_first, sessions[1])))
     store.close()
