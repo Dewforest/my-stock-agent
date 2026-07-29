@@ -336,6 +336,12 @@ class OrderPlan(_ImmutableBacktestModel):
         if self.submitted_quantity is not None:
             if self.raw_quantity is None or self.submitted_quantity > self.raw_quantity:
                 raise ValueError("submitted quantity requires and cannot exceed raw quantity")
+        if (
+            self.effective_quantity is not None
+            and self.submitted_quantity is not None
+            and self.effective_quantity > self.submitted_quantity
+        ):
+            raise ValueError("effective quantity cannot exceed submitted quantity")
         if self.order is not None:
             if self.order.symbol != self.symbol or self.order.quantity != self.submitted_quantity:
                 raise ValueError("order identity and quantity must match the plan")

@@ -583,6 +583,20 @@ def test_submitted_order_plan_requires_submission_identity_to_match_order() -> N
         )
 
 
+def test_submitted_order_plan_rejects_effective_quantity_above_submitted_quantity() -> None:
+    oversized_submission = submission().model_copy(update={"requested_quantity": Decimal("3")})
+
+    with pytest.raises(
+        ValidationError, match=r"effective quantity cannot exceed submitted quantity"
+    ):
+        OrderPlan(
+            **model_values(ready_plan(), exclude={"status", "submission", "effective_quantity"}),
+            status=OrderPlanStatus.SUBMITTED,
+            submission=oversized_submission,
+            effective_quantity=Decimal("3"),
+        )
+
+
 def test_session_result_accepts_auditable_exact_contract() -> None:
     revision = selected_revision()
     intent = strategy_intent()

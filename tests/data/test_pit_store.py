@@ -4,7 +4,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from pydantic import ConfigDict, ValidationError
+from pydantic import ConfigDict, PydanticDeprecatedSince20, ValidationError
 
 import stock_agent.data as data
 from stock_agent.data import PointInTimeStore, SelectedBarRevision
@@ -603,10 +603,21 @@ def test_selected_bar_revision_rejects_subclasses_and_copy_pollution() -> None:
         class MutableSelectedBarRevision(SelectedBarRevision):
             model_config = ConfigDict(frozen=False)
 
-    with pytest.raises(TypeError, match="copy updates"):
-        revision.model_copy(update={"source": []})
-    with pytest.raises(TypeError, match="copy updates"):
-        revision.copy(update={"source": []})
+    message = "immutable selected revisions do not support copy projections or updates"
+    for kwargs in ({"include": {}}, {"exclude": set()}, {"update": {}}):
+        with pytest.raises(TypeError, match=rf"^{message}$"):
+            revision.copy(**kwargs)
+    with pytest.raises(TypeError, match=rf"^{message}$"):
+        revision.model_copy(update={})
+
+    with pytest.warns(PydanticDeprecatedSince20):
+        shallow = revision.copy()
+    with pytest.warns(PydanticDeprecatedSince20):
+        deep = revision.copy(deep=True)
+    assert shallow == revision
+    assert deep == revision
+    assert shallow.model_fields_set == revision.model_fields_set
+    assert deep.model_fields_set == revision.model_fields_set
 
 
 @pytest.mark.parametrize("field", ["bar", "ingested_at", "source", "source_record_id"])

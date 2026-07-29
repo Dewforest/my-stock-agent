@@ -70,21 +70,20 @@ class SelectedBarRevision(BaseModel):
         update: Mapping[str, Any] | None = None,
         deep: bool = False,
     ) -> Self:
-        if update:
-            raise TypeError("immutable selected revisions do not support copy updates")
-        return super().copy(
-            include=include,
-            exclude=exclude,
-            update=update,
-            deep=deep,
-        )
+        if include is not None or exclude is not None or update is not None:
+            raise TypeError(
+                "immutable selected revisions do not support copy projections or updates"
+            )
+        return super().copy(deep=deep)
 
     def model_copy(
         self, *, update: Mapping[str, Any] | None = None, deep: bool = False
     ) -> Self:
-        if update:
-            raise TypeError("immutable selected revisions do not support copy updates")
-        return super().model_copy(update=update, deep=deep)
+        if update is not None:
+            raise TypeError(
+                "immutable selected revisions do not support copy projections or updates"
+            )
+        return super().model_copy(deep=deep)
 
 
 class PointInTimeStore:

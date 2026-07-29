@@ -3,7 +3,7 @@ from decimal import Decimal, Inexact, localcontext
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import PydanticDeprecatedSince20, ValidationError
 
 from stock_agent.account import (
     BookedFill,
@@ -118,6 +118,43 @@ def test_items_are_exact_frozen_canonical_and_copy_safe() -> None:
         booked_fill.model_copy(update={"fees": Decimal("-1")})
 
 
+def test_task10_immutable_leaf_models_reject_subclasses() -> None:
+    for leaf in (PositionMark, BookedFill, OpenExecutionBatchBooked, PortfolioMarked):
+        with pytest.raises(TypeError, match=rf"^{leaf.__name__} does not support subclasses$"):
+            type(f"Mutable{leaf.__name__}", (leaf,), {})
+
+
+def test_task10_immutable_leaf_copies_are_complete_and_reject_explicit_pollution() -> None:
+    values = (
+        mark("AAPL", "10"),
+        fill("fill", "AAPL", Side.BUY, "1", "10"),
+        batch(
+            "batch",
+            1,
+            (fill("fill", "AAPL", Side.BUY, "1", "10"),),
+            (mark("AAPL", "10"),),
+        ),
+        close("close", 1, (mark("AAPL", "10"),)),
+    )
+    message = "immutable ledger models do not support copy projections or updates"
+
+    for value in values:
+        with pytest.warns(PydanticDeprecatedSince20):
+            shallow = value.copy()
+        with pytest.warns(PydanticDeprecatedSince20):
+            deep = value.copy(deep=True)
+        assert shallow == value
+        assert deep == value
+        assert shallow.model_fields_set == value.model_fields_set
+        assert deep.model_fields_set == value.model_fields_set
+
+        for kwargs in ({"include": {}}, {"exclude": set()}, {"update": {}}):
+            with pytest.raises(TypeError, match=rf"^{message}$"):
+                value.copy(**kwargs)
+        with pytest.raises(TypeError, match=rf"^{message}$"):
+            value.model_copy(update={})
+
+
 @pytest.mark.parametrize("side", [Side.BUY, Side.SELL])
 def test_booked_fill_accepts_only_executable_exact_side(side: Side) -> None:
     assert fill("fill", "AAPL", side, "0.000000000001", "999", "0").side is side
@@ -152,14 +189,6 @@ def test_items_use_supported_decimal_boundary(
             BookedFill(**values)
 
 
-class PositionMarkChild(PositionMark):
-    pass
-
-
-class BookedFillChild(BookedFill):
-    pass
-
-
 def test_batch_contracts_require_exact_tuples_items_order_and_unique_ids() -> None:
     good_fill = fill("fill-1", "AAPL", Side.BUY, "1", "10")
     good_mark = mark("AAPL", "10")
@@ -170,31 +199,12 @@ def test_batch_contracts_require_exact_tuples_items_order_and_unique_ids() -> No
         {"fills": [], "marks": (good_mark,)},
         {"fills": (), "marks": (good_mark,)},
         {"fills": (good_fill, good_fill), "marks": (good_mark,)},
-        {
-            "fills": (
-                BookedFillChild(
-                    fill_id="child",
-                    symbol="AAPL",
-                    side=Side.BUY,
-                    quantity=Decimal("1"),
-                    price=Decimal("1"),
-                    fees=Decimal("0"),
-                ),
-            ),
-            "marks": (good_mark,),
-        },
         {"fills": (good_fill,), "marks": [good_mark]},
         {
             "fills": (good_fill,),
             "marks": (mark("MSFT", "10"), mark("AAPL", "10")),
         },
         {"fills": (good_fill,), "marks": (good_mark, good_mark)},
-        {
-            "fills": (good_fill,),
-            "marks": (
-                PositionMarkChild(symbol="AAPL", price=Decimal("10")),
-            ),
-        },
     ]
     for values in invalid:
         with pytest.raises(ValidationError):
@@ -457,10 +467,6 @@ def test_append_many_contract_empty_noop_and_atomic_failure() -> None:
     assert state(value) == before
 
 
-class PortfolioMarkedChild(PortfolioMarked):
-    pass
-
-
 class CashInitializedChild(CashInitialized):
     pass
 
@@ -483,9 +489,8 @@ def test_append_accepts_legacy_subclass_without_weakening_append_many_contract()
     assert value.events == (legacy, closing_mark)
 
 
-def test_append_many_rejects_event_subclasses_duplicate_ids_and_time_atomically() -> None:
+def test_append_many_rejects_duplicate_ids_and_time_atomically() -> None:
     cases: tuple[tuple[object, ...], ...] = (
-        (PortfolioMarkedChild(**common("child", 1), session_date=SESSION, marks=()),),
         (close("same", 1, ()), close("same", 2, ())),
         (close("later", 2, ()), close("earlier", 1, ())),
     )

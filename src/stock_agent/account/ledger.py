@@ -89,21 +89,16 @@ class _CopySafeMixin:
         update: Mapping[str, Any] | None = None,
         deep: bool = False,
     ) -> Self:
-        if update:
-            raise TypeError("immutable ledger models do not support copy updates")
-        return super().copy(  # type: ignore[misc]
-            include=include,
-            exclude=exclude,
-            update=update,
-            deep=deep,
-        )
+        if include is not None or exclude is not None or update is not None:
+            raise TypeError("immutable ledger models do not support copy projections or updates")
+        return super().copy(deep=deep)  # type: ignore[misc]
 
     def model_copy(
         self, *, update: Mapping[str, Any] | None = None, deep: bool = False
     ) -> Self:
-        if update:
-            raise TypeError("immutable ledger models do not support copy updates")
-        return super().model_copy(update=update, deep=deep)  # type: ignore[misc]
+        if update is not None:
+            raise TypeError("immutable ledger models do not support copy projections or updates")
+        return super().model_copy(deep=deep)  # type: ignore[misc]
 
 
 class PositionMark(_CopySafeMixin, BaseModel):
@@ -115,6 +110,9 @@ class PositionMark(_CopySafeMixin, BaseModel):
 
     symbol: Symbol
     price: PositiveDecimal
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("PositionMark does not support subclasses")
 
 
 class BookedFill(_CopySafeMixin, BaseModel):
@@ -130,6 +128,9 @@ class BookedFill(_CopySafeMixin, BaseModel):
     quantity: PositiveDecimal
     price: PositiveDecimal
     fees: NonNegativeDecimal
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("BookedFill does not support subclasses")
 
     @field_validator("side", mode="before")
     @classmethod
@@ -244,6 +245,9 @@ class _CompleteValuationEvent(_CopySafeMixin, _LedgerEvent):
 class OpenExecutionBatchBooked(_CompleteValuationEvent):
     fills: tuple[BookedFill, ...]
 
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("OpenExecutionBatchBooked does not support subclasses")
+
     @field_validator("fills", mode="before")
     @classmethod
     def fills_are_exact_nonempty_tuple(cls, value: object) -> object:
@@ -265,7 +269,8 @@ class OpenExecutionBatchBooked(_CompleteValuationEvent):
 
 
 class PortfolioMarked(_CompleteValuationEvent):
-    pass
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("PortfolioMarked does not support subclasses")
 
 
 class CashAdjusted(_LedgerEvent):
