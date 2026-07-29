@@ -35,6 +35,33 @@ def _revalidate_exact(value: object, expected: type[_ModelT], name: str) -> _Mod
         return expected(**_model_values(value))
 
 
+def _revalidate_exact_strict(value: object, expected: type[_ModelT], name: str) -> _ModelT:
+    if type(value) is not expected:
+        raise TypeError(f"{name} must be exactly {expected.__name__}")
+    return expected.model_validate(_model_values(value), strict=True)
+
+
+def _rebuild_risk_decision(value: object) -> RiskDecision:
+    if type(value) is not RiskDecision:
+        raise TypeError("risk decision must be exactly RiskDecision")
+    values = _model_values(value)
+    original = _revalidate_exact_strict(
+        values["original_intent"], StrategyIntent, "original intent"
+    )
+    raw_reduction = values["risk_reduction"]
+    reduction = (
+        None
+        if raw_reduction is None
+        else _revalidate_exact_strict(
+            raw_reduction, RiskReductionTarget, "risk decision reduction"
+        )
+    )
+    return RiskDecision.model_validate(
+        {**values, "original_intent": original, "risk_reduction": reduction},
+        strict=True,
+    )
+
+
 def _validate_inputs(
     *,
     run_id: object,
@@ -63,13 +90,13 @@ def _validate_inputs(
     rebuilt_portfolio = _revalidate_exact(portfolio, PortfolioSnapshot, "portfolio")
     if type(risk_decisions) is not tuple:
         raise TypeError("risk_decisions must be an exact tuple")
-    decisions = tuple(
-        _revalidate_exact(item, RiskDecision, "risk decision") for item in risk_decisions
-    )
+    decisions = tuple(_rebuild_risk_decision(item) for item in risk_decisions)
     reduction = (
         None
         if portfolio_reduction is None
-        else _revalidate_exact(portfolio_reduction, RiskReductionTarget, "portfolio_reduction")
+        else _revalidate_exact_strict(
+            portfolio_reduction, RiskReductionTarget, "portfolio_reduction"
+        )
     )
     if snapshot.market is not rebuilt_portfolio.market:
         raise ValueError("market snapshot and portfolio markets must match")
@@ -77,7 +104,7 @@ def _validate_inputs(
         raise ValueError("market snapshot and portfolio as_of values must match")
     symbols: list[str] = []
     for item in decisions:
-        original = _revalidate_exact(item.original_intent, StrategyIntent, "original intent")
+        original = item.original_intent
         if original.strategy_id != strategy_id.strip():
             raise ValueError("risk decision strategy_id must match strategy_id")
         if original.market is not snapshot.market:
@@ -215,6 +242,14 @@ def _strategy_plan(
             reason="HOLD intent has no order",
         )
     if intent.side is Side.SELL:
+        if target_weight != 0:
+            return _terminal_plan(
+                status=OrderPlanStatus.REJECTED,
+                source=source,
+                symbol=intent.symbol,
+                target_weight=target_weight,
+                reason="SELL intent requires zero approved target weight",
+            )
         if position is None:
             return _terminal_plan(
                 status=OrderPlanStatus.SKIPPED,
@@ -223,6 +258,19 @@ def _strategy_plan(
                 target_weight=target_weight,
                 raw_quantity=Decimal(0),
                 reason="SELL intent has no held quantity",
+            )
+        if (
+            not position.quantity.is_finite()
+            or position.quantity <= 0
+            or position.quantity >= _MAX_QUANTITY
+        ):
+            return _terminal_plan(
+                status=OrderPlanStatus.REJECTED,
+                source=source,
+                symbol=intent.symbol,
+                target_weight=target_weight,
+                raw_quantity=position.quantity if position.quantity.is_finite() else None,
+                reason="quantity exceeds supported planning range",
             )
         return _ready_plan(
             run_id=run_id,

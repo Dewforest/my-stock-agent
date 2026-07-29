@@ -223,6 +223,49 @@ def test_sell_uses_exact_held_quantity_and_no_holding_skips() -> None:
     assert skipped.status is OrderPlanStatus.SKIPPED
 
 
+def test_sell_rejects_nonzero_approved_target_even_for_a_valid_decision() -> None:
+    held = portfolio(
+        cash="700",
+        positions=(
+            Position(
+                symbol="AAPL",
+                quantity=Decimal("3"),
+                average_cost=Decimal("80"),
+                market_value=Decimal("300"),
+            ),
+        ),
+    )
+    approved = decision(intent(side=Side.SELL, target="0"), target="0.1")
+
+    plan = planning(approved, held=held)[0]
+
+    assert plan.status is OrderPlanStatus.REJECTED
+    assert plan.reason == "SELL intent requires zero approved target weight"
+    assert plan.order is None
+
+
+@pytest.mark.parametrize("quantity", [Decimal("1E26"), Decimal("1E100")])
+def test_sell_rejects_held_quantity_outside_planning_range(quantity: Decimal) -> None:
+    held = portfolio(
+        cash="0",
+        nav=str(quantity),
+        positions=(
+            Position(
+                symbol="AAPL",
+                quantity=quantity,
+                average_cost=Decimal("1"),
+                market_value=quantity,
+            ),
+        ),
+    )
+
+    plan = planning(decision(intent(side=Side.SELL, target="0")), held=held)[0]
+
+    assert plan.status is OrderPlanStatus.REJECTED
+    assert plan.reason == "quantity exceeds supported planning range"
+    assert plan.order is None
+
+
 @pytest.mark.parametrize(
     "risk_decision",
     [decision(intent(side=Side.REDUCE), target="0.2")],
@@ -571,3 +614,92 @@ def test_planner_rejects_entry_mismatches_before_planning() -> None:
         plan_orders(**{**kwargs, "risk_decisions": (approved, approved)})
     with pytest.raises(ValueError, match="reduction"):
         plan_orders(**{**kwargs, "portfolio_reduction": reduction_target()})
+
+
+def test_planner_revalidates_polluted_nested_intent_before_planning() -> None:
+    clean = intent()
+    polluted_intent = StrategyIntent.model_construct(
+        **{
+            name: getattr(clean, name)
+            for name in StrategyIntent.model_fields
+            if name != "side"
+        },
+        side="BUY",
+    )
+    polluted_decision = RiskDecision.model_construct(
+        original_intent=polluted_intent,
+        status=RiskDecisionStatus.APPROVED,
+        approved_target_weight=Decimal("0.2"),
+        rule_ids=(),
+        reasons=(),
+        risk_reduction=None,
+    )
+
+    with pytest.raises((ValidationError, ValueError)):
+        planning(polluted_decision)
+
+
+def test_planner_uses_rebuilt_nested_intent_for_planning() -> None:
+    clean = intent()
+    unnormalized_intent = StrategyIntent.model_construct(
+        **{
+            name: ("aapl" if name == "symbol" else getattr(clean, name))
+            for name in StrategyIntent.model_fields
+        }
+    )
+    shallow_decision = RiskDecision.model_construct(
+        original_intent=unnormalized_intent,
+        status=RiskDecisionStatus.APPROVED,
+        approved_target_weight=Decimal("0.2"),
+        rule_ids=(),
+        reasons=(),
+        risk_reduction=None,
+    )
+
+    plan = planning(shallow_decision)[0]
+
+    assert plan.status is OrderPlanStatus.READY
+    assert plan.symbol == "AAPL"
+    assert plan.order is not None and plan.order.symbol == "AAPL"
+
+
+def test_planner_revalidates_missing_nested_intent_field_before_planning() -> None:
+    clean = intent()
+    incomplete_intent = StrategyIntent.model_construct(
+        **{
+            name: getattr(clean, name)
+            for name in StrategyIntent.model_fields
+            if name != "symbol"
+        }
+    )
+    polluted_decision = RiskDecision.model_construct(
+        original_intent=incomplete_intent,
+        status=RiskDecisionStatus.APPROVED,
+        approved_target_weight=Decimal("0.2"),
+        rule_ids=(),
+        reasons=(),
+        risk_reduction=None,
+    )
+
+    with pytest.raises((ValidationError, ValueError)):
+        planning(polluted_decision)
+
+
+def test_planner_revalidates_polluted_nested_reduction_before_agreement_check() -> None:
+    clean_reduction = reduction_target()
+    polluted_reduction = RiskReductionTarget.model_construct(
+        current_gross_exposure="0.8",
+        target_gross_exposure=clean_reduction.target_gross_exposure,
+        review_required=True,
+    )
+    polluted_decision = RiskDecision.model_construct(
+        original_intent=intent(),
+        status=RiskDecisionStatus.APPROVED,
+        approved_target_weight=Decimal("0.2"),
+        rule_ids=(),
+        reasons=(),
+        risk_reduction=polluted_reduction,
+    )
+
+    with pytest.raises((ValidationError, ValueError)):
+        planning(polluted_decision, reduction=clean_reduction)
