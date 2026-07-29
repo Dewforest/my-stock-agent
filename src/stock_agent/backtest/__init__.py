@@ -8,6 +8,7 @@ from stock_agent.backtest.models import (
     OrderPlanStatus,
     SessionResult,
 )
+from stock_agent.backtest.planning import plan_orders, record_submission
 
 __all__ = [
     "BacktestInputManifest",
@@ -18,4 +19,6 @@ __all__ = [
     "OrderPlanSource",
     "OrderPlanStatus",
     "SessionResult",
+    "plan_orders",
+    "record_submission",
 ]

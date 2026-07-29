@@ -375,6 +375,8 @@ def test_backtest_package_exports_exact_contract() -> None:
         "OrderPlanSource",
         "OrderPlanStatus",
         "SessionResult",
+        "plan_orders",
+        "record_submission",
     ]
 
 
