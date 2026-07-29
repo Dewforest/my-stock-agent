@@ -266,7 +266,6 @@ class ExecutionSimulator:
                 for pending in self._pending
                 if pending.intent.market is market
                 and session_date >= pending.eligible_session
-                and pending.intent.symbol in bars_by_symbol
             }
             missing_accounts = sorted(required_accounts - remaining_cash.keys())
             if missing_accounts:

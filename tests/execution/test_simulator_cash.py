@@ -161,6 +161,30 @@ def test_missing_cash_for_an_eligible_account_is_atomic() -> None:
     assert value.pending_order_ids == ("first", "second")
 
 
+def test_missing_cash_for_eligible_order_without_bar_is_atomic() -> None:
+    value = simulator()
+    value.submit(intent("no-bar"), D1)
+
+    with pytest.raises(
+        ValueError, match="available_cash_by_account missing eligible account account-1"
+    ):
+        value.process_session(
+            market=Market.US,
+            session_date=D3,
+            bars=(),
+            available_cash_by_account={},
+        )
+
+    assert value.pending_order_ids == ("no-bar",)
+    fill = value.process_session(
+        market=Market.US,
+        session_date=D2,
+        bars=[bar()],
+        available_cash_by_account={"account-1": Decimal("101")},
+    )[0]
+    assert fill.status is FillStatus.FILLED
+
+
 def test_omitted_cash_mapping_preserves_legacy_unfunded_fill_behavior() -> None:
     value = simulator(bps="100")
     value.submit(intent("legacy", quantity="2"), D1)
