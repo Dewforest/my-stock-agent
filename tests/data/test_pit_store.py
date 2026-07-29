@@ -1,12 +1,13 @@
-from datetime import UTC, date, datetime, tzinfo
+from datetime import UTC, date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from pathlib import Path
 
 import duckdb
 import pytest
+from pydantic import ConfigDict, ValidationError
 
 import stock_agent.data as data
-from stock_agent.data import PointInTimeStore
+from stock_agent.data import PointInTimeStore, SelectedBarRevision
 from stock_agent.domain import Bar, Market
 
 
@@ -532,5 +533,252 @@ def test_close_is_idempotent_and_closed_store_rejects_operations() -> None:
         )
 
 
-def test_data_public_api_exports_only_point_in_time_store() -> None:
-    assert data.__all__ == ["PointInTimeStore"]
+def test_selected_bar_revision_is_exact_frozen_and_normalized() -> None:
+    bar = make_bar()
+    revision = SelectedBarRevision(
+        bar=bar,
+        ingested_at=datetime(2026, 7, 25, 1, tzinfo=UTC),
+        source=" test-feed ",
+        source_record_id=" revision-1 ",
+    )
+
+    assert tuple(SelectedBarRevision.model_fields) == (
+        "bar",
+        "ingested_at",
+        "source",
+        "source_record_id",
+    )
+    assert revision.model_dump() == {
+        "bar": bar.model_dump(),
+        "ingested_at": datetime(2026, 7, 25, 1, tzinfo=UTC),
+        "source": "test-feed",
+        "source_record_id": "revision-1",
+    }
+    assert not any(type(value) is tuple for value in revision.__dict__.values())
+    with pytest.raises(ValidationError):
+        revision.source = "other-feed"
+    with pytest.raises(ValidationError):
+        SelectedBarRevision(
+            bar=bar,
+            ingested_at=datetime(2026, 7, 25, 1, tzinfo=UTC),
+            source="test-feed",
+            source_record_id="revision-1",
+            unknown=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"ingested_at": datetime(2026, 7, 25, 1)}, "timezone"),
+        ({"source": "   "}, "source"),
+        ({"source_record_id": "   "}, "source_record_id"),
+    ],
+)
+def test_selected_bar_revision_rejects_invalid_metadata(
+    overrides: dict[str, object], message: str
+) -> None:
+    values: dict[str, object] = {
+        "bar": make_bar(),
+        "ingested_at": datetime(2026, 7, 25, 1, tzinfo=UTC),
+        "source": "test-feed",
+        "source_record_id": "revision-1",
+    }
+    values.update(overrides)
+
+    with pytest.raises(ValidationError, match=message):
+        SelectedBarRevision(**values)
+
+
+def test_selected_bar_revision_rejects_subclasses_and_copy_pollution() -> None:
+    revision = SelectedBarRevision(
+        bar=make_bar(),
+        ingested_at=datetime(2026, 7, 25, 1, tzinfo=UTC),
+        source="test-feed",
+        source_record_id="revision-1",
+    )
+
+    with pytest.raises(TypeError, match="does not support subclasses"):
+
+        class MutableSelectedBarRevision(SelectedBarRevision):
+            model_config = ConfigDict(frozen=False)
+
+    with pytest.raises(TypeError, match="copy updates"):
+        revision.model_copy(update={"source": []})
+    with pytest.raises(TypeError, match="copy updates"):
+        revision.copy(update={"source": []})
+
+
+@pytest.mark.parametrize("field", ["bar", "ingested_at", "source", "source_record_id"])
+def test_selected_bar_revision_revalidates_constructed_pollution(field: str) -> None:
+    values: dict[str, object] = {
+        "bar": make_bar(),
+        "ingested_at": datetime(2026, 7, 25, 1, tzinfo=UTC),
+        "source": "test-feed",
+        "source_record_id": "revision-1",
+    }
+    values[field] = []
+    polluted = SelectedBarRevision.model_construct(**values)
+
+    with pytest.raises(ValidationError):
+        SelectedBarRevision.model_validate(polluted)
+
+
+def test_selected_bar_revision_rejects_bar_subclasses_and_constructed_bar_pollution() -> None:
+    class MutableBar(Bar):
+        model_config = ConfigDict(frozen=False)
+
+    mutable_bar = MutableBar(**make_bar().model_dump())
+    values = {name: getattr(make_bar(), name) for name in Bar.model_fields}
+    values["close"] = []
+    polluted_bar = Bar.model_construct(**values)
+    metadata = {
+        "ingested_at": datetime(2026, 7, 25, 1, tzinfo=UTC),
+        "source": "test-feed",
+        "source_record_id": "revision-1",
+    }
+
+    with pytest.raises(ValidationError):
+        SelectedBarRevision(bar=mutable_bar, **metadata)
+    with pytest.raises(ValidationError):
+        SelectedBarRevision(bar=polluted_bar, **metadata)
+
+
+def test_latest_revision_returns_selected_bar_and_metadata() -> None:
+    store = PointInTimeStore()
+    bar = make_bar()
+    ingested_at = datetime(2026, 7, 25, 1, tzinfo=UTC)
+    store.append_bar(
+        bar,
+        ingested_at=ingested_at,
+        source="test-feed",
+        source_record_id="revision-1",
+    )
+
+    assert store.latest_bar_revision_as_of(
+        market=Market.US,
+        symbol="AAPL",
+        session_date=date(2026, 7, 24),
+        as_of=datetime(2026, 7, 26, tzinfo=UTC),
+    ) == SelectedBarRevision(
+        bar=bar,
+        ingested_at=ingested_at,
+        source="test-feed",
+        source_record_id="revision-1",
+    )
+
+
+def test_latest_revision_uses_source_record_id_as_final_tie_breaker() -> None:
+    store = PointInTimeStore()
+    ingested_at = datetime(2026, 7, 25, 1, tzinfo=UTC)
+    lower_id = make_bar(close=Decimal("333.02"))
+    higher_id = make_bar(close=Decimal("334.00"))
+    store.append_bar(
+        higher_id,
+        ingested_at=ingested_at,
+        source="test-feed",
+        source_record_id="record-z",
+    )
+    store.append_bar(
+        lower_id,
+        ingested_at=ingested_at,
+        source="test-feed",
+        source_record_id="record-a",
+    )
+
+    revision = store.latest_bar_revision_as_of(
+        market=Market.US,
+        symbol="AAPL",
+        session_date=date(2026, 7, 24),
+        as_of=datetime(2026, 7, 26, tzinfo=UTC),
+    )
+
+    assert revision is not None
+    assert revision.bar == higher_id
+    assert revision.source_record_id == "record-z"
+
+
+def test_latest_revision_correction_is_hidden_until_exact_availability_instant() -> None:
+    store = PointInTimeStore()
+    original = make_bar()
+    correction = make_bar(
+        close=Decimal("334.00"),
+        available_at=datetime(2026, 7, 27, tzinfo=UTC),
+    )
+    store.append_bar(
+        original,
+        ingested_at=datetime(2026, 7, 25, 1, tzinfo=UTC),
+        source="test-feed",
+        source_record_id="v1",
+    )
+    store.append_bar(
+        correction,
+        ingested_at=datetime(2026, 7, 27, 1, tzinfo=UTC),
+        source="correction-feed",
+        source_record_id="v2",
+    )
+
+    before = store.latest_bar_revision_as_of(
+        market=Market.US,
+        symbol="AAPL",
+        session_date=date(2026, 7, 24),
+        as_of=datetime(2026, 7, 27, 7, 59, 59, 999999, tzinfo=timezone(timedelta(hours=8))),
+    )
+    at = store.latest_bar_revision_as_of(
+        market=Market.US,
+        symbol="AAPL",
+        session_date=date(2026, 7, 24),
+        as_of=datetime(2026, 7, 27, 8, tzinfo=timezone(timedelta(hours=8))),
+    )
+
+    assert before is not None and before.bar == original
+    assert at is not None and at.bar == correction
+    assert at.ingested_at == datetime(2026, 7, 27, 1, tzinfo=UTC)
+    assert at.source == "correction-feed"
+    assert at.source_record_id == "v2"
+
+
+def test_latest_revision_none_validation_and_closed_semantics_match_wrapper() -> None:
+    store = PointInTimeStore()
+    query = {
+        "market": Market.US,
+        "symbol": "AAPL",
+        "session_date": date(2026, 7, 24),
+        "as_of": datetime(2026, 7, 26, tzinfo=UTC),
+    }
+    assert store.latest_bar_revision_as_of(**query) is None
+    with pytest.raises(ValueError, match="as_of must be timezone-aware"):
+        store.latest_bar_revision_as_of(**(query | {"as_of": datetime(2026, 7, 26)}))
+
+    store.close()
+    with pytest.raises(RuntimeError, match="PointInTimeStore is closed"):
+        store.latest_bar_revision_as_of(**query)
+    with pytest.raises(RuntimeError, match="PointInTimeStore is closed"):
+        store.latest_bar_as_of(**query)
+
+
+def test_latest_bar_wrapper_is_byte_equal_to_selected_revision_bar() -> None:
+    store = PointInTimeStore()
+    store.append_bar(
+        make_bar(),
+        ingested_at=datetime(2026, 7, 25, 1, tzinfo=UTC),
+        source="test-feed",
+        source_record_id="revision-1",
+    )
+    query = {
+        "market": Market.US,
+        "symbol": " aapl ",
+        "session_date": date(2026, 7, 24),
+        "as_of": datetime(2026, 7, 26, 8, tzinfo=timezone(timedelta(hours=8))),
+    }
+
+    revision = store.latest_bar_revision_as_of(**query)
+    wrapped = store.latest_bar_as_of(**query)
+
+    assert revision is not None and wrapped is not None
+    assert wrapped.model_dump_json().encode() == revision.bar.model_dump_json().encode()
+
+
+def test_data_public_api_exports_store_and_selected_revision() -> None:
+    assert data.__all__ == ["PointInTimeStore", "SelectedBarRevision"]
+    assert data.SelectedBarRevision is SelectedBarRevision
