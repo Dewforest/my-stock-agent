@@ -5,7 +5,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 import stock_agent.backtest as backtest
-from stock_agent.account import AcquisitionLot, CashInitialized
+from stock_agent.account import AcquisitionLot, CashAdjusted, CashInitialized
 from stock_agent.backtest import (
     BacktestInputManifest,
     BacktestResult,
@@ -181,12 +181,13 @@ def portfolio_snapshot(as_of: datetime = US_CLOSE_2) -> PortfolioSnapshot:
 
 
 def session_result(session_date: date = D2) -> SessionResult:
+    close_at = US_CLOSE_1 if session_date == D1 else US_CLOSE_2
     return SessionResult(
         session_date=session_date,
         execution_results=(),
         selected_revisions=(),
-        market_snapshot=market_snapshot(),
-        portfolio_snapshot=portfolio_snapshot(),
+        market_snapshot=market_snapshot(close_at),
+        portfolio_snapshot=portfolio_snapshot(close_at),
         intents=(),
         risk_decisions=(),
         portfolio_reduction=None,
@@ -216,7 +217,7 @@ def result() -> BacktestResult:
         manifest=manifest(),
         spec_fingerprint="backtest-spec-sha256:" + "a" * 64,
         resolved_data_fingerprint="resolved-data-sha256:" + "b" * 64,
-        sessions=(session_result(),),
+        sessions=(session_result(D1), session_result(D2)),
         ledger_events=(
             CashInitialized(
                 event_id="event-1",
@@ -529,9 +530,19 @@ def test_manifest_contains_only_frozen_resolved_inputs() -> None:
     "overrides",
     [
         {"calendar_sessions": [D1, D2]},
+        {"calendar_sessions": ()},
+        {"calendar_sessions": (D1,)},
         {"calendar_sessions": (D2, D1)},
         {"calendar_sessions": (D1, D1)},
         {"sessions": [session(), session(D2, US_OPEN_2, US_CLOSE_2)]},
+        {"sessions": ()},
+        {"sessions": (session(),)},
+        {
+            "sessions": (
+                session(D1, US_OPEN_1, US_OPEN_2),
+                session(D2, US_OPEN_2, US_CLOSE_2),
+            )
+        },
         {"pit_knowledge_policy": "other"},
         {"transaction_cost_bps": -1},
         {"transaction_cost_bps": Decimal("-1")},
@@ -551,6 +562,105 @@ def test_backtest_result_accepts_concrete_ledger_events_and_final_lots() -> None
     value = BacktestResult(**model_values(result(), exclude={"final_lots"}), final_lots=(lot,))
     assert type(value.ledger_events[0]) is CashInitialized
     assert value.final_lots == (lot,)
+
+
+@pytest.mark.parametrize(
+    "sessions",
+    [
+        (session_result(D2), session_result(D2)),
+        (
+            SessionResult(
+                **model_values(
+                    session_result(D1),
+                    exclude={"market_snapshot", "portfolio_snapshot"},
+                ),
+                market_snapshot=market_snapshot(US_CLOSE_2),
+                portfolio_snapshot=portfolio_snapshot(US_CLOSE_2),
+            ),
+            session_result(D2),
+        ),
+    ],
+)
+def test_backtest_result_requires_manifest_dates_and_close_snapshots(
+    sessions: tuple[SessionResult, ...],
+) -> None:
+    with pytest.raises(ValidationError):
+        BacktestResult(**model_values(result(), exclude={"sessions"}), sessions=sessions)
+
+
+@pytest.mark.parametrize(
+    "ledger_events",
+    [
+        (),
+        (
+            CashAdjusted(
+                event_id="event-2",
+                account_id="account-1",
+                market=Market.US,
+                occurred_at=US_CLOSE_1,
+                amount=Decimal("1"),
+                reason="correction",
+            ),
+        ),
+    ],
+)
+def test_backtest_result_requires_initial_cash_ledger_event(
+    ledger_events: tuple[object, ...],
+) -> None:
+    with pytest.raises(ValidationError):
+        BacktestResult(
+            **model_values(result(), exclude={"ledger_events"}),
+            ledger_events=ledger_events,
+        )
+
+
+def test_backtest_result_accepts_signed_realized_pnl() -> None:
+    value = BacktestResult(
+        **model_values(result(), exclude={"realized_pnl"}),
+        realized_pnl=Decimal("-12.340000000000"),
+    )
+
+    assert value.realized_pnl == Decimal("-12.340000000000")
+
+
+@pytest.mark.parametrize(
+    "realized_pnl",
+    [
+        0,
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        Decimal("1E26"),
+        Decimal("0.0000000000001"),
+    ],
+)
+def test_backtest_result_rejects_unsupported_realized_pnl(realized_pnl: object) -> None:
+    with pytest.raises(ValidationError):
+        BacktestResult(
+            **model_values(result(), exclude={"realized_pnl"}),
+            realized_pnl=realized_pnl,
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"spec_fingerprint": "resolved-data-sha256:" + "a" * 64},
+        {"resolved_data_fingerprint": "backtest-spec-sha256:" + "b" * 64},
+        {"spec_fingerprint": "unknown-sha256:" + "a" * 64},
+        {"resolved_data_fingerprint": "resolved-data-sha256:" + "B" * 64},
+        {"spec_fingerprint": "backtest-spec-sha256:" + "a" * 63},
+        {"resolved_data_fingerprint": "resolved-data-sha256:" + "b" * 65},
+        {"spec_fingerprint": " backtest-spec-sha256:" + "a" * 64},
+        {"resolved_data_fingerprint": "resolved-data-sha256:" + "b" * 64 + " "},
+    ],
+)
+def test_backtest_result_requires_field_specific_exact_fingerprints(
+    overrides: dict[str, object],
+) -> None:
+    values = model_values(result())
+    values.update(overrides)
+    with pytest.raises(ValidationError):
+        BacktestResult(**values)
 
 
 @pytest.mark.parametrize("field", ["sessions", "ledger_events", "final_lots"])
@@ -585,7 +695,7 @@ def test_backtest_result_rejects_identity_and_final_consistency_errors(
         BacktestResult(**values)
 
 
-def all_models() -> tuple[object, ...]:
+def all_models() -> tuple[BaseModel, ...]:
     return (
         session(),
         spec(),
@@ -607,9 +717,28 @@ def test_all_models_are_frozen_extra_forbidden_strict_and_copy_update_safe() -> 
         with pytest.raises(TypeError):
             model.model_copy(update={"unexpected": True})
         with pytest.raises(TypeError):
+            model.model_copy(update={})
+        with pytest.raises(TypeError):
             model.copy(update={"unexpected": True})
+        with pytest.raises(TypeError):
+            model.copy(update={})
+        with pytest.raises(TypeError):
+            model.copy(include={})
+        with pytest.raises(TypeError):
+            model.copy(exclude=set())
+        with pytest.warns(DeprecationWarning):
+            assert model.copy() == model
+        with pytest.warns(DeprecationWarning):
+            assert model.copy(deep=True) == model
         assert model.model_copy() == model
         assert model.model_copy(deep=True) == model
+
+    baseline = result()
+    with pytest.warns(DeprecationWarning):
+        deprecated_deep_copy = baseline.copy(deep=True)
+    modern_deep_copy = baseline.model_copy(deep=True)
+    assert deprecated_deep_copy.manifest is not baseline.manifest
+    assert modern_deep_copy.manifest is not baseline.manifest
 
 
 def test_all_models_forbid_subclasses() -> None:
@@ -623,6 +752,19 @@ def test_all_models_forbid_subclasses() -> None:
     ):
         with pytest.raises(TypeError, match="does not support subclasses"):
             type("MutableBoundary", (model_type,), {"model_config": ConfigDict(frozen=False)})
+
+
+def test_nested_model_construct_missing_field_raises_validation_error() -> None:
+    incomplete_bar = Bar.model_construct(**open_bar().model_dump(exclude={"high"}))
+
+    with pytest.raises(ValidationError):
+        BacktestSession(
+            session_date=D1,
+            open_at=US_OPEN_1,
+            close_at=US_CLOSE_1,
+            open_bars=(incomplete_bar,),
+            cn_session_states=(),
+        )
 
 
 def test_nested_polluted_objects_are_fully_revalidated() -> None:
@@ -687,7 +829,10 @@ def test_nested_subclasses_are_rejected() -> None:
 
 
 def test_validation_does_not_change_hostile_ambient_decimal_context() -> None:
-    baseline = result()
+    baseline = BacktestResult(
+        **model_values(result(), exclude={"realized_pnl"}),
+        realized_pnl=Decimal("-12.340000000000"),
+    )
     with localcontext() as context:
         context.prec = 1
         context.Emin = 0
@@ -697,5 +842,5 @@ def test_validation_does_not_change_hostile_ambient_decimal_context() -> None:
         value = BacktestResult(**model_values(baseline))
         after = repr(context)
 
-    assert value.realized_pnl == Decimal("0.00")
+    assert value.realized_pnl == Decimal("-12.340000000000")
     assert after == before

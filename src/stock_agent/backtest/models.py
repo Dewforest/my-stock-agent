@@ -77,12 +77,18 @@ def _supported_decimal(value: object) -> Decimal:
 
 FiniteNonNegativeDecimal = Annotated[Decimal, BeforeValidator(_finite_decimal), Field(ge=0)]
 FiniteUnitDecimal = Annotated[Decimal, BeforeValidator(_finite_decimal), Field(ge=0, le=1)]
+SupportedDecimal = Annotated[Decimal, BeforeValidator(_supported_decimal)]
 SupportedNonNegativeDecimal = Annotated[Decimal, BeforeValidator(_supported_decimal), Field(ge=0)]
-Fingerprint = Annotated[
+SpecFingerprint = Annotated[
     str,
     StringConstraints(
-        strip_whitespace=True,
-        pattern=r"^[a-z][a-z0-9-]*-sha256:[0-9a-f]{64}$",
+        pattern=r"^backtest-spec-sha256:[0-9a-f]{64}$",
+    ),
+]
+ResolvedDataFingerprint = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^resolved-data-sha256:[0-9a-f]{64}$",
     ),
 ]
 
@@ -100,7 +106,13 @@ def _exact_enum(value: object, expected: type[StrEnum], name: str) -> object:
 
 
 def _model_values(value: BaseModel) -> dict[str, object]:
-    return {name: getattr(value, name) for name in value.__class__.model_fields}
+    values: dict[str, object] = {}
+    for name in value.__class__.model_fields:
+        try:
+            values[name] = getattr(value, name)
+        except AttributeError as error:
+            raise ValueError(f"nested model is missing field {name!r}") from error
+    return values
 
 
 def _rebuild_exact(value: object, expected: type[T], name: str) -> T:
@@ -157,14 +169,14 @@ class _ImmutableBacktestModel(BaseModel):
         update: Mapping[str, Any] | None = None,
         deep: bool = False,
     ) -> Self:
-        if update:
-            raise TypeError("immutable backtest models do not support copy updates")
-        return super().copy(include=include, exclude=exclude, update=update, deep=deep)
+        if include is not None or exclude is not None or update is not None:
+            raise TypeError("immutable backtest models do not support copy projections or updates")
+        return super().copy(deep=deep)
 
     def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
-        if update:
+        if update is not None:
             raise TypeError("immutable backtest models do not support copy updates")
-        return super().model_copy(update=update, deep=deep)
+        return super().model_copy(deep=deep)
 
 
 class BacktestSession(_ImmutableBacktestModel):
@@ -485,8 +497,8 @@ class BacktestInputManifest(_ImmutableBacktestModel):
     @field_validator("calendar_sessions", mode="before")
     @classmethod
     def calendar_is_exact(cls, value: object) -> tuple[date, ...]:
-        if type(value) is not tuple:
-            raise ValueError("calendar_sessions must be an exact tuple")
+        if type(value) is not tuple or len(value) < 2:
+            raise ValueError("calendar_sessions must be an exact tuple with at least two items")
         for item in value:
             _plain_date(item)
         return value
@@ -494,8 +506,8 @@ class BacktestInputManifest(_ImmutableBacktestModel):
     @field_validator("sessions", mode="before")
     @classmethod
     def sessions_are_exact(cls, value: object) -> tuple[BacktestSession, ...]:
-        if type(value) is not tuple:
-            raise ValueError("sessions must be an exact tuple")
+        if type(value) is not tuple or len(value) < 2:
+            raise ValueError("sessions must be an exact tuple with at least two items")
         return tuple(_rebuild_exact(item, BacktestSession, "session") for item in value)
 
     @model_validator(mode="after")
@@ -509,21 +521,29 @@ class BacktestInputManifest(_ImmutableBacktestModel):
             self.calendar_sessions
         ) != len(set(self.calendar_sessions)):
             raise ValueError("calendar sessions must be sorted and unique")
-        if tuple(item.session_date for item in self.sessions) != self.calendar_sessions:
+        session_dates = tuple(item.session_date for item in self.sessions)
+        if session_dates != tuple(sorted(session_dates)) or len(session_dates) != len(
+            set(session_dates)
+        ):
+            raise ValueError("sessions must have sorted unique dates")
+        if session_dates != self.calendar_sessions:
             raise ValueError("session dates must exactly match the calendar slice")
         for item in self.sessions:
             if item.open_bars[0].market is not self.market:
                 raise ValueError("session markets must match manifest market")
             if tuple(bar.symbol for bar in item.open_bars) != symbols:
                 raise ValueError("session frames must match the manifest universe")
+        for previous, following in zip(self.sessions, self.sessions[1:], strict=False):
+            if previous.close_at.astimezone(UTC) >= following.open_at.astimezone(UTC):
+                raise ValueError("each close instant must be before the next open")
         return self
 
 
 class BacktestResult(_ImmutableBacktestModel):
     run_id: NonBlankText
     manifest: BacktestInputManifest
-    spec_fingerprint: Fingerprint
-    resolved_data_fingerprint: Fingerprint
+    spec_fingerprint: SpecFingerprint
+    resolved_data_fingerprint: ResolvedDataFingerprint
     sessions: tuple[SessionResult, ...]
     ledger_events: tuple[
         CashInitialized
@@ -538,7 +558,7 @@ class BacktestResult(_ImmutableBacktestModel):
     ]
     final_lots: tuple[AcquisitionLot, ...]
     final_snapshot: PortfolioSnapshot
-    realized_pnl: FiniteNonNegativeDecimal
+    realized_pnl: SupportedDecimal
 
     @field_validator("manifest", mode="before")
     @classmethod
@@ -555,8 +575,10 @@ class BacktestResult(_ImmutableBacktestModel):
     @field_validator("ledger_events", mode="before")
     @classmethod
     def events_are_exact(cls, value: object) -> tuple[BaseModel, ...]:
-        if type(value) is not tuple:
-            raise ValueError("ledger_events must be an exact tuple")
+        if type(value) is not tuple or not value:
+            raise ValueError("ledger_events must be a nonempty exact tuple")
+        if type(value[0]) is not CashInitialized:
+            raise ValueError("ledger_events must begin with exact CashInitialized")
         rebuilt: list[BaseModel] = []
         for item in value:
             if type(item) not in _LEDGER_EVENT_TYPES:
@@ -592,8 +614,17 @@ class BacktestResult(_ImmutableBacktestModel):
             item.account_id != account or item.market is not market for item in self.ledger_events
         ):
             raise ValueError("ledger event identity must match the manifest")
-        if self.sessions[-1].session_date != self.manifest.calendar_sessions[-1]:
-            raise ValueError("final session must match the manifest calendar")
+        result_dates = tuple(item.session_date for item in self.sessions)
+        if result_dates != self.manifest.calendar_sessions:
+            raise ValueError("session result dates must exactly match the manifest calendar")
+        if any(
+            result.portfolio_snapshot.as_of.astimezone(UTC)
+            != manifest_session.close_at.astimezone(UTC)
+            for result, manifest_session in zip(
+                self.sessions, self.manifest.sessions, strict=True
+            )
+        ):
+            raise ValueError("session snapshots must match manifest close instants")
         if self.sessions[-1].portfolio_snapshot != self.final_snapshot:
             raise ValueError("final snapshot must equal the final session snapshot")
         return self
