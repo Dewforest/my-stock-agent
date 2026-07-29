@@ -114,11 +114,12 @@ Test close marking:
 - mixed-price false peak is impossible;
 - snapshot replay reproduces the same state;
 - reversal of an upstream event fails atomically when a downstream complete mark becomes invalid;
-- reversing all dependent complete events allows a corrected stream.
+- `append_many` accepts only an exact event tuple, commits a complete candidate stream once, treats empty input as a no-op, and leaves state unchanged on any failure;
+- one `append_many` can reverse all dependent complete events and append a corrected stream atomically.
 
 **GREEN**
 
-Refactor ledger fill application into shared private operations used by legacy fill events and the new open batch. For the open batch, apply all accounting and all marks, then materialize positions/NAV/peak once. For the close event, apply all marks then materialize once. Keep legacy behavior unchanged. Extend event union, append checks, exports, active-event replay, and tests.
+Refactor ledger fill application into shared private operations used by legacy fill events and the new open batch. For the open batch, apply all accounting and all marks, then materialize positions/NAV/peak once. For the close event, apply all marks then materialize once. Add exact atomic `append_many`; make `append` delegate to it. Keep legacy behavior unchanged. Extend event union, append checks, exports, active-event replay, and tests.
 
 **Verify and commit**
 

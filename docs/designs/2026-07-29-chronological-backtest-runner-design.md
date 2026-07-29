@@ -72,9 +72,17 @@ PortfolioMarked(
 
 Existing `PositionMarked` remains backward compatible; the runner never uses it. Both new events join `LedgerEvent`, public exports, runtime checks, replay, snapshot replay, and reversal handling.
 
-### 2.4 Reversal dependency semantics
+### 2.4 Reversal dependency semantics and atomic correction append
 
-Both batch events are ordinary reversible events. Reversal always replays the complete active stream. If reversing an earlier fill/batch changes the held-symbol set expected by a later complete mark, the reversal fails atomically. A correction must reverse every affected downstream complete-mark or execution-batch event in the same logical correction workflow, then append replacement complete events. `OpenExecutionBatchBooked` is the runner's correction unit; an individual booked fill inside it is not independently reversible.
+Both batch events are ordinary reversible events. Reversal always replays the complete active stream. If reversing an earlier fill/batch changes the held-symbol set expected by a later complete mark, a lone reversal fails atomically. A correction must reverse every affected downstream complete-mark or execution-batch event in one candidate stream, then append replacement complete events. `OpenExecutionBatchBooked` is the runner's correction unit; an individual booked fill inside it is not independently reversible.
+
+Add:
+
+```python
+PortfolioLedger.append_many(events: tuple[LedgerEvent, ...]) -> None
+```
+
+It accepts an exact tuple of exact ledger events, validates account/market, IDs, initialization, and strictly increasing UTC instants across the existing and candidate streams, then computes active events, replays, and commits the complete candidate stream once. Empty input is a no-op; any failure leaves all ledger state unchanged. `append(event)` delegates to the one-item path. This API exists for atomic dependent corrections and general batch commit; it does not define valuation grouping. Atomic valuation remains solely the responsibility of `OpenExecutionBatchBooked` and `PortfolioMarked`.
 
 ## 3. Cash-Aware Next-Open Execution
 
