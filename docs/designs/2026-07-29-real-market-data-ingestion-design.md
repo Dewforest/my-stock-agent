@@ -1,8 +1,10 @@
 # Real Market Data Ingestion Design
 
 Date: 2026-07-29
-Status: Approved for implementation planning
+Status: Approved after invariant preflight
 Scope: Phase 1 Task 10D — provider-backed CN/US daily bars, incremental ingestion, and real-data backtest proof
+
+Normative contract: `docs/designs/2026-07-29-real-market-data-ingestion-contract.md`. The contract freezes wire schemas, authorities, state machines, atomicity, security, runner resolution, provenance, failure codes, and completion gates. If this overview is less specific, the contract controls; contradictory text is a design defect.
 
 ## 1. Goal
 
@@ -77,6 +79,8 @@ For a later fetch of the same event identity:
 - correction `available_at` is the current ingestion instant;
 - prior backtest session results remain unchanged.
 
+Ingestion compares against `latest_observed_bar_revision`, keyed by provider and event and ordered by local ingestion time. Builders and backtests use the separate business-PIT `latest_bar_revision_as_of` query. These authorities are not interchangeable. Changed observations require a strictly increasing per-stream ingestion instant.
+
 This provides chronological no-look-ahead against a frozen baseline and honest local correction history. Full historical-vintage PIT requires a vendor revision archive and is explicitly out of scope.
 
 `BacktestInputManifest.pit_knowledge_policy` must support and fingerprint the `current-view-baseline/v1` value. Existing fixture/backtest behavior keeps `business-available-at/v1`.
@@ -122,9 +126,9 @@ The protocol does not expose HTTP clients or provider-native dictionaries to con
 
 ### 5.4 HTTP transport
 
-A minimal injected transport accepts a URL plus non-secret headers and returns response bytes and status metadata. Production uses Python standard-library HTTP facilities; tests use deterministic in-memory responses. Transport exceptions are converted before they can expose a query string containing a key.
+A minimal injected transport uses the fixed HTTPS profile in the normative contract and returns bounded response bytes plus safe status metadata. Production uses `http.client.HTTPSConnection`; tests use deterministic in-memory responses. One timeout value is applied to connect and socket reads, with the failing stage reported separately. The profile forbids redirects and compression, caps bodies at 1 MiB, and admits strict UTF-8 only.
 
-The transport has explicit connect/read timeout configuration. This task does not retry automatically. Ambiguous network failure is surfaced so callers decide whether to retry.
+Transport exceptions are reduced to stable safe codes and metadata. A new exception is raised only after leaving the original handler so the complete exception graph cannot retain a query string or key. This task does not retry automatically; retryability is a frozen property of the error code.
 
 ### 5.5 Incremental ingestor
 
@@ -139,15 +143,15 @@ For each normalized provider bar it:
 
 1. verifies a matching session close exists;
 2. builds the domain close `Bar`;
-3. queries the latest locally visible revision for the event identity at ingestion time;
+3. queries the latest locally observed revision for the provider/event stream;
 4. skips an unchanged normalized payload;
 5. assigns baseline or correction availability according to Section 4;
 6. derives a deterministic source record ID from provider ID, market, symbol, session, canonical OHLCV, and availability policy;
-7. appends through the existing store API.
+7. appends the fully validated candidate batch through one atomic store transaction.
 
 The method returns an immutable `IngestionReport` containing requested, received, appended, and unchanged counts plus appended revision identities. Any rejected row aborts the batch before writes; the report does not imply partial-error success.
 
-Writes may occur one bar at a time because the current store has no batch transaction API. To avoid misleading atomicity, parsing and full-batch validation complete before the first write. Database errors after writing begins are surfaced with the exact successful prefix represented in store provenance; rollback semantics are not claimed.
+The store gains an atomic batch append API. Parsing, provider postconditions, schedule, numeric boundaries, authority conflicts, clocks, and batch identities all validate before the transaction. Any write failure rolls back the complete batch and returns no report. Task 10D has no partial-success or successful-prefix protocol.
 
 ### 5.6 Rolling overlap
 
@@ -176,6 +180,8 @@ For each session it creates:
 - a close bar from the persisted full OHLCV revision;
 - an execution-only open frame with `open == high == low == close == daily open`, volume zero, and `available_at == open_at`;
 - no strategy access to that open frame.
+
+Each synthetic open frame has a symbol-sorted provenance link to the exact persisted revision selected at that session's close. The source link enters the spec fingerprint. The runner freezes the full revision-selection matrix before cache lookup or mutable execution and validates own-session source identity against the open-frame link.
 
 The synthetic open frame is an execution input, not a claim that the full daily bar was known at the open.
 
@@ -236,7 +242,7 @@ Canonical hashing uses the existing audit utility:
 - UTC six-microsecond datetimes;
 - UTF-8 and tagged SHA-256.
 
-Source is the stable provider ID. Source record IDs include enough event and payload identity to make unchanged retries idempotent and changed payloads distinct.
+Source is the stable provider ID. Source record IDs use the exact tagged array in the normative contract, including provider record identity, normalized OHLCV, revision kind, availability instant, knowledge policy, and raw-price policy. This makes unchanged retries idempotent and makes rollback corrections distinct from their original baseline.
 
 Provider response order never determines store or report order.
 
@@ -272,13 +278,17 @@ With a real temporary DuckDB store:
 - provenance and source record IDs are exact;
 - parse failure writes nothing;
 - close schedule gaps fail before writes.
+- a failure at every atomic batch position rolls back all rows;
+- A → B → A rollback appends a new correction while repeated payloads remain unchanged.
 
 ### 10.3 Builder and runner tests
 
 - persisted closes become cumulative PIT snapshots;
 - open frames expose only the daily open value;
+- open frames link to the exact persisted own-session source revision;
 - missing calendar/session data fails;
-- manifest records `current-view-baseline/v1`;
+- runner freezes the complete resolved matrix before cache lookup and never re-queries during execution;
+- manifest records `current-view-baseline/v1` and `raw-unadjusted/no-corporate-actions/v1`;
 - fingerprints and independent equivalent results are deterministic.
 
 ### 10.4 Mandatory live acceptance
@@ -302,14 +312,10 @@ A skipped live test is not a completed Task 10D. If the API key or network is un
 
 ## 11. Delivery sequence
 
-1. Define exact provider and ingestion contracts.
-2. Implement Eastmoney parser/adapter.
-3. Implement Alpha Vantage parser/adapter with secret redaction.
-4. Implement incremental baseline/correction ingestion.
-5. Extend manifest knowledge-policy contract.
-6. Implement focused real-data spec assembly.
-7. Run CN live end to end.
-8. Run US live end to end with caller-provided environment key.
-9. Perform specification and code-quality review, then push the feature branch.
+1. Establish the shared audit foundation: exact contracts, separate observation/PIT authorities, atomic store batch, two manifest policies, frozen runner resolution, and open provenance.
+2. Deliver the complete CN vertical slice: strict transport/JSON, Eastmoney adapter, ingestion, builder, and deterministic provider-to-runner integration.
+3. Deliver the complete US vertical slice: Alpha Vantage adapter, compact coverage, full secret-boundary canary, and the same deterministic integration path.
+4. Execute and record both live provider-to-DuckDB-to-runner proofs against one relevant-source digest.
+5. Perform one final specification review, one quality review, all gates, and the feature-branch checkpoint.
 
 No step may replace a failed live path with fabricated output.
