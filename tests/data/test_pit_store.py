@@ -7,7 +7,7 @@ import pytest
 from pydantic import ConfigDict, PydanticDeprecatedSince20, ValidationError
 
 import stock_agent.data as data
-from stock_agent.data import PointInTimeStore, SelectedBarRevision
+from stock_agent.data import BarRevisionWrite, PointInTimeStore, SelectedBarRevision
 from stock_agent.domain import Bar, Market
 
 
@@ -948,5 +948,193 @@ def test_latest_bar_wrapper_is_byte_equal_to_selected_revision_bar() -> None:
 
 
 def test_data_public_api_exports_store_and_selected_revision() -> None:
-    assert data.__all__ == ["PointInTimeStore", "SelectedBarRevision"]
+    assert data.__all__ == [
+        "BarRevisionWrite",
+        "BatchAppendResult",
+        "PointInTimeStore",
+        "SelectedBarRevision",
+    ]
     assert data.SelectedBarRevision is SelectedBarRevision
+
+
+def _write(
+    *,
+    session_date: date,
+    source_record_id: str,
+    close: Decimal = Decimal("100"),
+) -> BarRevisionWrite:
+    available_at = datetime(
+        session_date.year,
+        session_date.month,
+        session_date.day,
+        21,
+        tzinfo=UTC,
+    )
+    return BarRevisionWrite(
+        bar=Bar(
+            symbol="AAPL",
+            market=Market.US,
+            session_date=session_date,
+            open=Decimal("100"),
+            high=max(Decimal("101"), close),
+            low=min(Decimal("99"), close),
+            close=close,
+            volume=Decimal("1000"),
+            available_at=available_at,
+        ),
+        ingested_at=available_at + timedelta(seconds=1),
+        source="alpha-vantage",
+        source_record_id=source_record_id,
+    )
+
+
+def test_latest_observed_ignores_business_availability_and_orders_by_ingestion() -> None:
+    store = PointInTimeStore()
+    session_date = date(2026, 7, 24)
+    baseline = _write(session_date=session_date, source_record_id="baseline")
+    correction = BarRevisionWrite(
+        bar=make_bar(
+            session_date=session_date,
+            open=Decimal("100"),
+            high=Decimal("111"),
+            low=Decimal("99"),
+            close=Decimal("111"),
+            volume=Decimal("1000"),
+            available_at=datetime(2026, 7, 28, tzinfo=UTC),
+        ),
+        ingested_at=datetime(2026, 7, 28, 1, tzinfo=UTC),
+        source="alpha-vantage",
+        source_record_id="correction",
+    )
+    store.append_bar_revisions((baseline,))
+    store.append_bar_revisions((correction,))
+
+    observed = store.latest_observed_bar_revision(
+        provider_id="alpha-vantage",
+        market=Market.US,
+        symbol="AAPL",
+        session_date=session_date,
+    )
+    business = store.latest_bar_revision_as_of(
+        market=Market.US,
+        symbol="AAPL",
+        session_date=session_date,
+        as_of=datetime(2026, 7, 25, tzinfo=UTC),
+    )
+
+    assert observed is not None and observed.source_record_id == "correction"
+    assert business is not None and business.source_record_id == "baseline"
+
+
+def test_atomic_batch_success_and_idempotent_result_are_exact() -> None:
+    store = PointInTimeStore()
+    writes = tuple(
+        _write(
+            session_date=date(2026, 7, day),
+            source_record_id=f"record-{day}",
+        )
+        for day in (22, 23, 24)
+    )
+    first = store.append_bar_revisions(writes)
+    second = store.append_bar_revisions(writes)
+
+    assert first.appended == tuple(
+        (item.source, item.source_record_id) for item in writes
+    )
+    assert first.unchanged == ()
+    assert second.appended == ()
+    assert second.unchanged == tuple(
+        (item.source, item.source_record_id) for item in writes
+    )
+
+
+@pytest.mark.parametrize("conflict_position", range(3))
+def test_atomic_batch_rolls_back_after_conflict_at_every_position(
+    conflict_position: int,
+) -> None:
+    store = PointInTimeStore()
+    session_dates = tuple(date(2026, 7, day) for day in (22, 23, 24))
+    conflicting = _write(
+        session_date=session_dates[conflict_position],
+        source_record_id="conflict",
+    )
+    store.append_bar_revisions((conflicting,))
+    candidates = [
+        _write(
+            session_date=session_date,
+            source_record_id=f"candidate-{index}",
+        )
+        for index, session_date in enumerate(session_dates)
+    ]
+    candidates[conflict_position] = BarRevisionWrite(
+        bar=make_bar(
+            symbol="AAPL",
+            session_date=session_dates[conflict_position],
+            open=Decimal("100"),
+            high=Decimal("102"),
+            low=Decimal("99"),
+            close=Decimal("102"),
+            volume=Decimal("1000"),
+            available_at=datetime(
+                2026, 7, session_dates[conflict_position].day, 21, tzinfo=UTC
+            ),
+        ),
+        ingested_at=datetime(
+            2026, 7, session_dates[conflict_position].day, 22, tzinfo=UTC
+        ),
+        source="alpha-vantage",
+        source_record_id="conflict",
+    )
+
+    with pytest.raises(ValueError, match="conflicting payload"):
+        store.append_bar_revisions(tuple(candidates))
+
+    for index, session_date in enumerate(session_dates):
+        selected = store.latest_bar_revision_as_of(
+            market=Market.US,
+            symbol="AAPL",
+            session_date=session_date,
+            as_of=datetime(2026, 7, 30, tzinfo=UTC),
+        )
+        if index == conflict_position:
+            assert selected is not None
+            assert selected.source_record_id == "conflict"
+        else:
+            assert selected is None
+
+
+def test_atomic_batch_rejects_duplicate_identities_before_transaction() -> None:
+    store = PointInTimeStore()
+    write = _write(session_date=date(2026, 7, 24), source_record_id="duplicate")
+    with pytest.raises(ValueError, match="duplicate"):
+        store.append_bar_revisions((write, write))
+    assert store.latest_observed_bar_revision(
+        provider_id="alpha-vantage",
+        market=Market.US,
+        symbol="AAPL",
+        session_date=date(2026, 7, 24),
+    ) is None
+
+
+def test_atomic_batch_rejects_second_provider_for_existing_event() -> None:
+    store = PointInTimeStore()
+    original = _write(
+        session_date=date(2026, 7, 24),
+        source_record_id="alpha-record",
+    )
+    store.append_bar_revisions((original,))
+    values = {
+        name: getattr(original, name) for name in BarRevisionWrite.model_fields
+    }
+    values.update(source="other-provider", source_record_id="other-record")
+    conflicting = BarRevisionWrite(**values)
+
+    with pytest.raises(ValueError, match="conflicting provider"):
+        store.append_bar_revisions((conflicting,))
+
+    assert store.latest_observed_bar_revision(
+        provider_id="other-provider",
+        market=Market.US,
+        symbol="AAPL",
+        session_date=date(2026, 7, 24),
+    ) is None

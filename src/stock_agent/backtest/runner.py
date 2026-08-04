@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, timedelta
 from decimal import (
     MAX_EMAX,
     MAX_PREC,
@@ -38,12 +38,14 @@ from stock_agent.backtest.models import (
     BacktestResult,
     BacktestSession,
     BacktestSpec,
+    OpenFrameSource,
     OrderPlan,
     OrderPlanStatus,
     SessionResult,
 )
 from stock_agent.backtest.planning import plan_orders, record_submission
 from stock_agent.data import PointInTimeStore, SelectedBarRevision
+from stock_agent.data.policies import is_real_market_data_policy
 from stock_agent.domain import Bar, PortfolioSnapshot, Side, StrategyIntent
 from stock_agent.execution import ExecutionSimulator, Fill, FillStatus
 from stock_agent.market import TradingCalendar
@@ -51,7 +53,6 @@ from stock_agent.risk import RiskContext, RiskEngine
 from stock_agent.strategies import MarketSnapshot, Strategy, StrategyContext
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
-_PIT_POLICY = "business-available-at/v1"
 
 
 def _arithmetic_context_for(*values: Decimal) -> Context:
@@ -84,6 +85,8 @@ def _arithmetic_context_for(*values: Decimal) -> Context:
 
 
 def _model_values(model: BaseModel) -> dict[str, object]:
+    if set(model.__dict__) != set(model.__class__.model_fields):
+        raise ValueError("nested model has polluted or missing fields")
     try:
         return {name: getattr(model, name) for name in model.__class__.model_fields}
     except AttributeError as error:
@@ -123,6 +126,17 @@ def _canonical_spec(spec: BacktestSpec) -> BacktestSpec:
                 "open_at": session.open_at.astimezone(UTC),
                 "close_at": session.close_at.astimezone(UTC),
                 "open_bars": tuple(_canonical_bar(bar) for bar in session.open_bars),
+                "open_frame_sources": tuple(
+                    OpenFrameSource.model_validate(
+                        {
+                            **_model_values(source),
+                            "available_at": source.available_at.astimezone(UTC),
+                            "ingested_at": source.ingested_at.astimezone(UTC),
+                        },
+                        strict=True,
+                    )
+                    for source in session.open_frame_sources
+                ),
             },
             strict=True,
         )
@@ -160,6 +174,18 @@ def _session_payload(session: BacktestSession) -> list[object]:
         [_bar_payload(bar) for bar in session.open_bars],
         [
             [
+                source.market.value,
+                source.symbol,
+                source.session_date.isoformat(),
+                source.source,
+                source.source_record_id,
+                canonical_datetime(source.available_at),
+                canonical_datetime(source.ingested_at),
+            ]
+            for source in session.open_frame_sources
+        ],
+        [
+            [
                 state.symbol,
                 state.session_date.isoformat(),
                 state.suspended,
@@ -185,6 +211,7 @@ def _manifest_payload(manifest: BacktestInputManifest) -> tuple[object, ...]:
         manifest.strategy_config_version,
         canonical_decimal(manifest.transaction_cost_bps),
         manifest.pit_knowledge_policy,
+        manifest.market_data_price_policy,
     )
 
 
@@ -245,7 +272,7 @@ class ChronologicalBacktestRunner:
         self._strategy_config_version = config_version.strip()
         self._risk_engine = RiskEngine() if risk_engine is None else risk_engine
         self._transaction_cost_bps = _canonical_decimal_value(transaction_cost_bps)
-        self._registry: dict[str, tuple[str, BacktestResult]] = {}
+        self._registry: dict[str, tuple[str, str, BacktestResult]] = {}
 
     def run(self, spec: BacktestSpec) -> BacktestResult:
         clean_spec = _canonical_spec(_rebuild_exact(spec, BacktestSpec, "spec"))
@@ -271,17 +298,29 @@ class ChronologicalBacktestRunner:
             strategy_id=self._strategy_id,
             strategy_config_version=clean_spec.strategy_config_version,
             transaction_cost_bps=self._transaction_cost_bps,
-            pit_knowledge_policy=_PIT_POLICY,
+            pit_knowledge_policy=clean_spec.pit_knowledge_policy,
+            market_data_price_policy=clean_spec.market_data_price_policy,
         )
         spec_fingerprint = tagged_sha256("backtest-spec", _manifest_payload(manifest))
+        revision_matrix = self._resolve_revision_matrix(clean_spec)
+        revisions_payload = tuple(
+            _revision_payload(revision)
+            for owning_session in revision_matrix
+            for revision in owning_session
+        )
+        resolved_fingerprint = tagged_sha256("resolved-data", revisions_payload)
 
         cached = self._registry.get(clean_spec.run_id)
         if cached is not None:
-            cached_fingerprint, cached_result = cached
-            if cached_fingerprint != spec_fingerprint:
+            cached_spec_fingerprint, cached_resolved_fingerprint, cached_result = (
+                cached
+            )
+            if cached_spec_fingerprint != spec_fingerprint:
                 raise ValueError(
                     "run_id conflicts with a different backtest specification"
                 )
+            if cached_resolved_fingerprint != resolved_fingerprint:
+                raise ValueError("run_id conflicts with different resolved data")
             return cached_result
 
         ledger = PortfolioLedger(clean_spec.account_id, clean_spec.market)
@@ -332,11 +371,7 @@ class ChronologicalBacktestRunner:
             new_position_notional = self._new_position_notional(
                 filled, pre_open_symbols
             )
-            selected_revisions = self._resolve_revisions(
-                spec=clean_spec,
-                through=index,
-                as_of=session.close_at,
-            )
+            selected_revisions = revision_matrix[index]
             market_snapshot = MarketSnapshot(
                 as_of=session.close_at,
                 market=clean_spec.market,
@@ -442,12 +477,6 @@ class ChronologicalBacktestRunner:
                 )
             )
 
-        revisions_payload = tuple(
-            _revision_payload(revision)
-            for result in session_results
-            for revision in result.selected_revisions
-        )
-        resolved_fingerprint = tagged_sha256("resolved-data", revisions_payload)
         final_snapshot = session_results[-1].portfolio_snapshot
         result = BacktestResult(
             run_id=clean_spec.run_id,
@@ -460,7 +489,11 @@ class ChronologicalBacktestRunner:
             final_snapshot=final_snapshot,
             realized_pnl=ledger.realized_pnl,
         )
-        self._registry[clean_spec.run_id] = (spec_fingerprint, result)
+        self._registry[clean_spec.run_id] = (
+            spec_fingerprint,
+            resolved_fingerprint,
+            result,
+        )
         return result
 
     def _validate_spec(self, spec: BacktestSpec) -> tuple[date, ...]:
@@ -573,25 +606,76 @@ class ChronologicalBacktestRunner:
             )
         )
 
-    def _resolve_revisions(
-        self, *, spec: BacktestSpec, through: int, as_of: datetime
-    ) -> tuple[SelectedBarRevision, ...]:
-        selected: list[SelectedBarRevision] = []
-        for instrument in spec.instruments:
-            for session in spec.sessions[: through + 1]:
-                revision = self._store.latest_bar_revision_as_of(
-                    market=spec.market,
-                    symbol=instrument.symbol,
-                    session_date=session.session_date,
-                    as_of=as_of,
-                )
-                if revision is None:
-                    raise ValueError(
-                        "missing point-in-time bar for "
-                        f"{instrument.symbol} on {session.session_date.isoformat()}"
+    def _resolve_revision_matrix(
+        self, spec: BacktestSpec
+    ) -> tuple[tuple[SelectedBarRevision, ...], ...]:
+        matrix: list[tuple[SelectedBarRevision, ...]] = []
+        for owning_index, owning_session in enumerate(spec.sessions):
+            selected: list[SelectedBarRevision] = []
+            own_revisions: list[SelectedBarRevision] = []
+            for instrument in spec.instruments:
+                instrument_history: list[SelectedBarRevision] = []
+                for historical_session in spec.sessions[: owning_index + 1]:
+                    revision = self._store.latest_bar_revision_as_of(
+                        market=spec.market,
+                        symbol=instrument.symbol,
+                        session_date=historical_session.session_date,
+                        as_of=owning_session.close_at,
                     )
-                selected.append(revision)
-        return tuple(selected)
+                    if revision is None:
+                        raise ValueError(
+                            "missing point-in-time bar for "
+                            f"{instrument.symbol} on "
+                            f"{historical_session.session_date.isoformat()}"
+                        )
+                    instrument_history.append(revision)
+                selected.extend(instrument_history)
+                own_revisions.append(instrument_history[-1])
+            self._validate_open_frame_sources(
+                owning_session,
+                tuple(own_revisions),
+                required=is_real_market_data_policy(
+                    spec.pit_knowledge_policy,
+                    spec.market_data_price_policy,
+                ),
+            )
+            matrix.append(tuple(selected))
+        return tuple(matrix)
+
+    @staticmethod
+    def _validate_open_frame_sources(
+        session: BacktestSession,
+        own_revisions: tuple[SelectedBarRevision, ...],
+        *,
+        required: bool,
+    ) -> None:
+        if not session.open_frame_sources:
+            if required:
+                raise ValueError("real-data sessions require open provenance")
+            return
+        if len(session.open_frame_sources) != len(own_revisions):
+            raise ValueError("open provenance must exactly match own-session revisions")
+        for open_bar, source, revision in zip(
+            session.open_bars,
+            session.open_frame_sources,
+            own_revisions,
+            strict=True,
+        ):
+            if (
+                source.market is not revision.bar.market
+                or source.symbol != revision.bar.symbol
+                or source.session_date != revision.bar.session_date
+                or source.source != revision.source
+                or source.source_record_id != revision.source_record_id
+                or source.available_at.astimezone(UTC)
+                != revision.bar.available_at.astimezone(UTC)
+                or source.ingested_at.astimezone(UTC)
+                != revision.ingested_at.astimezone(UTC)
+                or open_bar.open != revision.bar.open
+            ):
+                raise ValueError(
+                    "open provenance must match the exact own-session revision"
+                )
 
     def _evaluate_strategy(
         self,

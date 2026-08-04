@@ -17,6 +17,12 @@ from stock_agent.backtest import (
     SessionResult,
 )
 from stock_agent.data import PointInTimeStore, SelectedBarRevision
+from stock_agent.data.policies import (
+    BUSINESS_AVAILABLE_PIT_POLICY,
+    CURRENT_VIEW_BASELINE_PIT_POLICY,
+    FIXTURE_PRICE_POLICY,
+    RAW_UNADJUSTED_PRICE_POLICY,
+)
 from stock_agent.domain import (
     Bar,
     Currency,
@@ -372,10 +378,12 @@ def test_backtest_package_exports_exact_contract() -> None:
         "BacktestSession",
         "BacktestSpec",
         "ChronologicalBacktestRunner",
+        "OpenFrameSource",
         "OrderPlan",
         "OrderPlanSource",
         "OrderPlanStatus",
         "SessionResult",
+        "build_real_data_backtest_spec",
         "plan_orders",
         "record_submission",
     ]
@@ -823,6 +831,14 @@ def test_manifest_contains_only_frozen_resolved_inputs() -> None:
             )
         },
         {"pit_knowledge_policy": "other"},
+        {
+            "pit_knowledge_policy": CURRENT_VIEW_BASELINE_PIT_POLICY,
+            "market_data_price_policy": FIXTURE_PRICE_POLICY,
+        },
+        {
+            "pit_knowledge_policy": BUSINESS_AVAILABLE_PIT_POLICY,
+            "market_data_price_policy": RAW_UNADJUSTED_PRICE_POLICY,
+        },
         {"transaction_cost_bps": -1},
         {"transaction_cost_bps": Decimal("-1")},
     ],

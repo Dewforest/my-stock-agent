@@ -488,7 +488,7 @@ def test_spec_sessions_must_be_an_exact_contiguous_calendar_slice() -> None:
         ("list", TypeError, "strategy output must be an exact tuple"),
         ("tuple-subclass-output", TypeError, "strategy output must be an exact tuple"),
         ("tuple-subclass", TypeError, "strategy intent must be exactly StrategyIntent"),
-        ("polluted", ValueError, "nested model is missing a required field"),
+        ("polluted", ValueError, "nested model has polluted or missing fields"),
         ("strategy-id", ValueError, "strategy intent strategy_id must match the strategy"),
         ("market", ValueError, "strategy intent market must match the spec"),
         ("as-of", ValueError, "strategy intent as_of must match the session close"),
@@ -556,7 +556,7 @@ def test_missing_current_close_does_not_append_mark_or_call_strategy(
     ):
         runner.run(spec)
 
-    assert tuple(type(event) for event in ledgers[0].events) == (CashInitialized,)
+    assert ledgers == []
     assert strategy.calls == 0
     store.close()
 
@@ -595,11 +595,8 @@ def test_missing_cumulative_close_does_not_append_that_session_mark_or_call_stra
     ):
         runner.run(spec)
 
-    marks = tuple(
-        event for event in ledgers[0].events if type(event) is PortfolioMarked
-    )
-    assert tuple(event.session_date for event in marks) == (DATES[0],)
-    assert strategy.calls == 1
+    assert ledgers == []
+    assert strategy.calls == 0
     store.close()
 
 
@@ -871,7 +868,7 @@ def test_multiple_successful_fills_share_one_ordered_open_batch_with_complete_ma
     store.close()
 
 
-def test_successful_run_is_cached_before_store_strategy_and_execution_construction(
+def test_successful_run_resolves_frozen_matrix_before_cache_but_skips_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store, calendar, spec = _fixture()
@@ -902,10 +899,18 @@ def test_successful_run_is_cached_before_store_strategy_and_execution_constructi
         source_record_id="late-correction-d1",
     )
 
+    query_count = 0
+    original_query = store.latest_bar_revision_as_of
+
+    def count_query(*args: object, **kwargs: object):
+        nonlocal query_count
+        query_count += 1
+        return original_query(*args, **kwargs)
+
     def unexpected(*args: object, **kwargs: object) -> None:
         raise AssertionError("cached run must not touch mutable dependencies")
 
-    monkeypatch.setattr(PointInTimeStore, "latest_bar_revision_as_of", unexpected)
+    monkeypatch.setattr(store, "latest_bar_revision_as_of", count_query)
     monkeypatch.setattr(CountingScriptedStrategy, "evaluate", unexpected)
     monkeypatch.setattr(runner_module, "ExecutionSimulator", unexpected)
 
@@ -914,6 +919,7 @@ def test_successful_run_is_cached_before_store_strategy_and_execution_constructi
     assert second is first
     assert second.resolved_data_fingerprint == original_fingerprint
     assert second.sessions == first.sessions
+    assert query_count == sum(range(1, len(DATES) + 1))
     store.close()
 
 
@@ -975,7 +981,6 @@ def test_same_run_id_with_different_canonical_spec_conflicts_before_dependencies
     def unexpected(*args: object, **kwargs: object) -> None:
         raise AssertionError("conflict must precede mutable dependencies")
 
-    monkeypatch.setattr(PointInTimeStore, "latest_bar_revision_as_of", unexpected)
     monkeypatch.setattr(ScriptedStrategy, "evaluate", unexpected)
     monkeypatch.setattr(runner_module, "ExecutionSimulator", unexpected)
 
@@ -1175,7 +1180,6 @@ def test_same_run_id_with_changed_cn_state_conflicts_before_dependencies(
     def unexpected(*args: object, **kwargs: object) -> None:
         raise AssertionError("CN conflict must precede mutable dependencies")
 
-    monkeypatch.setattr(PointInTimeStore, "latest_bar_revision_as_of", unexpected)
     monkeypatch.setattr(CaseStrategy, "evaluate", unexpected)
     monkeypatch.setattr(runner_module, "ExecutionSimulator", unexpected)
     changed_first = cn_session(dates[0], suspended=True)

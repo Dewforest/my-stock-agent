@@ -2,7 +2,7 @@ from collections.abc import Mapping
 from datetime import UTC, date, timedelta
 from decimal import Decimal, localcontext
 from enum import StrEnum
-from typing import Annotated, Any, Literal, Self, TypeVar
+from typing import Annotated, Any, Self, TypeVar
 
 from pydantic import (
     AwareDatetime,
@@ -27,6 +27,14 @@ from stock_agent.account import (
     SellFilled,
 )
 from stock_agent.data import SelectedBarRevision
+from stock_agent.data.policies import (
+    BUSINESS_AVAILABLE_PIT_POLICY,
+    FIXTURE_PRICE_POLICY,
+    VALID_MARKET_DATA_POLICY_PAIRS,
+    MarketDataPricePolicy,
+    PitKnowledgePolicy,
+    is_real_market_data_policy,
+)
 from stock_agent.domain import Bar, Instrument, Market, PortfolioSnapshot, StrategyIntent
 from stock_agent.execution import Fill, FillStatus, OrderIntent
 from stock_agent.execution.cn_rules import CnSessionState
@@ -91,8 +99,6 @@ ResolvedDataFingerprint = Annotated[
         pattern=r"^resolved-data-sha256:[0-9a-f]{64}$",
     ),
 ]
-
-
 def _plain_date(value: object) -> object:
     if type(value) is not date:
         raise ValueError("value must be a plain date")
@@ -106,6 +112,9 @@ def _exact_enum(value: object, expected: type[StrEnum], name: str) -> object:
 
 
 def _model_values(value: BaseModel) -> dict[str, object]:
+    expected = set(value.__class__.model_fields)
+    if set(value.__dict__) != expected:
+        raise ValueError("nested model has polluted or missing fields")
     values: dict[str, object] = {}
     for name in value.__class__.model_fields:
         try:
@@ -179,11 +188,35 @@ class _ImmutableBacktestModel(BaseModel):
         return super().model_copy(deep=deep)
 
 
+class OpenFrameSource(_ImmutableBacktestModel):
+    market: Market
+    symbol: Symbol
+    session_date: date
+    source: NonBlankText
+    source_record_id: NonBlankText
+    available_at: AwareDatetime
+    ingested_at: AwareDatetime
+
+    @field_validator("market", mode="before")
+    @classmethod
+    def market_is_exact(cls, value: object) -> object:
+        return _exact_enum(value, Market, "market")
+
+    _session_date_is_plain = field_validator("session_date", mode="before")(_plain_date)
+
+    @model_validator(mode="after")
+    def clocks_are_consistent(self) -> Self:
+        if self.ingested_at.astimezone(UTC) < self.available_at.astimezone(UTC):
+            raise ValueError("ingested_at cannot be before available_at")
+        return self
+
+
 class BacktestSession(_ImmutableBacktestModel):
     session_date: date
     open_at: AwareDatetime
     close_at: AwareDatetime
     open_bars: tuple[Bar, ...]
+    open_frame_sources: tuple[OpenFrameSource, ...] = ()
     cn_session_states: tuple[CnSessionState, ...] = ()
 
     _session_date_is_plain = field_validator("session_date", mode="before")(_plain_date)
@@ -194,6 +227,18 @@ class BacktestSession(_ImmutableBacktestModel):
         if type(value) is not tuple or not value:
             raise ValueError("open_bars must be a nonempty exact tuple")
         return tuple(_rebuild_exact(item, Bar, "open bar") for item in value)
+
+    @field_validator("open_frame_sources", mode="before")
+    @classmethod
+    def open_sources_are_exact(
+        cls, value: object
+    ) -> tuple[OpenFrameSource, ...]:
+        if type(value) is not tuple:
+            raise ValueError("open_frame_sources must be an exact tuple")
+        return tuple(
+            _rebuild_exact(item, OpenFrameSource, "open frame source")
+            for item in value
+        )
 
     @field_validator("cn_session_states", mode="before")
     @classmethod
@@ -219,6 +264,20 @@ class BacktestSession(_ImmutableBacktestModel):
                 raise ValueError("open bars must contain only the open price")
             if item.volume != 0:
                 raise ValueError("open bars must have zero volume")
+        if self.open_frame_sources:
+            source_symbols = tuple(item.symbol for item in self.open_frame_sources)
+            if source_symbols != symbols:
+                raise ValueError("open frame sources must exactly match open bars")
+            if any(
+                item.market is not market
+                or item.session_date != self.session_date
+                or item.available_at.astimezone(UTC)
+                > self.close_at.astimezone(UTC)
+                for item in self.open_frame_sources
+            ):
+                raise ValueError(
+                    "open frame sources must match market, session, and close authority"
+                )
         state_symbols = tuple(item.symbol for item in self.cn_session_states)
         if state_symbols != tuple(sorted(state_symbols)) or len(state_symbols) != len(
             set(state_symbols)
@@ -242,6 +301,8 @@ class BacktestSpec(_ImmutableBacktestModel):
     instruments: tuple[Instrument, ...]
     sessions: tuple[BacktestSession, ...]
     strategy_config_version: NonBlankText
+    pit_knowledge_policy: PitKnowledgePolicy = BUSINESS_AVAILABLE_PIT_POLICY
+    market_data_price_policy: MarketDataPricePolicy = FIXTURE_PRICE_POLICY
 
     @field_validator("market", mode="before")
     @classmethod
@@ -264,6 +325,13 @@ class BacktestSpec(_ImmutableBacktestModel):
 
     @model_validator(mode="after")
     def spec_is_consistent(self) -> Self:
+        policy_pair = (
+            self.pit_knowledge_policy,
+            self.market_data_price_policy,
+        )
+        if policy_pair not in VALID_MARKET_DATA_POLICY_PAIRS:
+            raise ValueError("real-data policies must be selected as an atomic policy pair")
+        real_pit = is_real_market_data_policy(*policy_pair)
         symbols = tuple(item.symbol for item in self.instruments)
         if symbols != tuple(sorted(symbols)) or len(symbols) != len(set(symbols)):
             raise ValueError("instruments must be symbol-sorted and unique")
@@ -277,6 +345,12 @@ class BacktestSpec(_ImmutableBacktestModel):
                 raise ValueError("session markets must match the spec market")
             if tuple(bar.symbol for bar in item.open_bars) != symbols:
                 raise ValueError("session frames must exactly match the fixed universe")
+            if real_pit and tuple(
+                source.symbol for source in item.open_frame_sources
+            ) != symbols:
+                raise ValueError(
+                    "real-data sessions require complete fixed-universe open provenance"
+                )
         for previous, following in zip(self.sessions, self.sessions[1:], strict=False):
             if previous.close_at.astimezone(UTC) >= following.open_at.astimezone(UTC):
                 raise ValueError("each close instant must be before the next open")
@@ -527,7 +601,8 @@ class BacktestInputManifest(_ImmutableBacktestModel):
     strategy_id: NonBlankText
     strategy_config_version: NonBlankText
     transaction_cost_bps: SupportedNonNegativeDecimal
-    pit_knowledge_policy: Literal["business-available-at/v1"]
+    pit_knowledge_policy: PitKnowledgePolicy
+    market_data_price_policy: MarketDataPricePolicy = FIXTURE_PRICE_POLICY
 
     @field_validator("market", mode="before")
     @classmethod
@@ -559,6 +634,11 @@ class BacktestInputManifest(_ImmutableBacktestModel):
 
     @model_validator(mode="after")
     def manifest_is_consistent(self) -> Self:
+        if (
+            self.pit_knowledge_policy,
+            self.market_data_price_policy,
+        ) not in VALID_MARKET_DATA_POLICY_PAIRS:
+            raise ValueError("market-data policies must be a supported atomic policy pair")
         symbols = tuple(item.symbol for item in self.instruments)
         if symbols != tuple(sorted(symbols)) or len(symbols) != len(set(symbols)):
             raise ValueError("instruments must be symbol-sorted and unique")
