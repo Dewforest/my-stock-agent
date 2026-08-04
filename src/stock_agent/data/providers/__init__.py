@@ -1,3 +1,4 @@
+from stock_agent.data.providers.alpha_vantage import AlphaVantageDailyBarProvider
 from stock_agent.data.providers.eastmoney import EastmoneyDailyBarProvider
 from stock_agent.data.providers.errors import MarketDataError, MarketDataErrorCode
 from stock_agent.data.providers.http import HttpsTransport
@@ -13,6 +14,7 @@ from stock_agent.data.providers.models import (
 from stock_agent.data.providers.protocol import HistoricalDailyBarProvider
 
 __all__ = [
+    "AlphaVantageDailyBarProvider",
     "AppendedRevisionIdentity",
     "BoundedSessionSchedule",
     "DailyBarRequest",

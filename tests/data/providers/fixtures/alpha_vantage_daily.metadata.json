@@ -1,0 +1,17 @@
+{
+  "provider_id": "alpha-vantage",
+  "retrieved_utc": "2026-08-04T00:00:00Z",
+  "request_parameters": {
+    "function": "TIME_SERIES_DAILY",
+    "symbol": "IBM",
+    "outputsize": "compact",
+    "datatype": "json"
+  },
+  "source_type": "documentation-derived",
+  "transformations_redactions": [
+    "Constructed from the documented Alpha Vantage TIME_SERIES_DAILY compact response shape.",
+    "Limited to seven IBM-shaped daily rows spanning the five-session test schedule plus coverage boundary rows.",
+    "The private apikey parameter was omitted; no credentials, cookies, request headers, or user data were read or added."
+  ],
+  "fixture_sha256": "4e9f999627bf6d6b3fd3ea767daf7e00fb697c2345a8e2a7714b80cf625070f5"
+}

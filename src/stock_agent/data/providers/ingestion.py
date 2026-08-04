@@ -76,6 +76,31 @@ def _read_provider_id(provider: HistoricalDailyBarProvider) -> str:
     return _provider_id(value)
 
 
+def _ingestor_constructor_result(
+    provider: object,
+    store: object,
+) -> tuple[
+    tuple[object, str, PointInTimeStore] | None,
+    str | None,
+    tuple[MarketDataErrorCode, dict[str, str | int | bool]] | None,
+]:
+    if type(store) is not PointInTimeStore:
+        return None, "store must be exactly PointInTimeStore", None
+    try:
+        fetch = provider.fetch_daily_bars
+    except BaseException:
+        return None, "provider must implement HistoricalDailyBarProvider", None
+    if not callable(fetch):
+        return None, "provider must implement HistoricalDailyBarProvider", None
+    try:
+        provider_id = _read_provider_id(provider)  # type: ignore[arg-type]
+    except MarketDataError as error:
+        return None, None, (error.code, dict(error.metadata))
+    except BaseException:
+        return None, None, (MarketDataErrorCode.INTERNAL_CONTRACT, {})
+    return (provider, provider_id, store), None, None
+
+
 def _payload(bar: FetchedDailyBar) -> tuple[object, ...]:
     return (
         bar.market,
@@ -124,19 +149,54 @@ class IncrementalBarIngestor:
         provider: HistoricalDailyBarProvider,
         store: PointInTimeStore,
     ) -> None:
-        if type(store) is not PointInTimeStore:
-            raise TypeError("store must be exactly PointInTimeStore")
-        try:
-            fetch = provider.fetch_daily_bars
-        except AttributeError as error:
-            raise TypeError("provider must implement HistoricalDailyBarProvider") from error
-        if not callable(fetch):
-            raise TypeError("provider must implement HistoricalDailyBarProvider")
-        self._provider = provider
-        self._provider_id = _read_provider_id(provider)
-        self._store = store
+        state, type_error, descriptor = _ingestor_constructor_result(provider, store)
+        provider = None  # type: ignore[assignment]
+        store = None  # type: ignore[assignment]
+        if state is None:
+            self = None  # type: ignore[assignment]
+            if descriptor is not None:
+                code, metadata = descriptor
+                raise MarketDataError(code, metadata=metadata) from None
+            assert type_error is not None
+            raise TypeError(type_error) from None
+        selected_provider, provider_id, selected_store = state
+        self._provider = selected_provider
+        self._provider_id = provider_id
+        self._store = selected_store
 
     def ingest(
+        self,
+        *,
+        request: DailyBarRequest,
+        schedule: BoundedSessionSchedule,
+        ingested_at: datetime,
+    ) -> IngestionReport:
+        report: IngestionReport | None = None
+        descriptor: tuple[
+            MarketDataErrorCode,
+            dict[str, str | int | bool],
+        ] | None = None
+        try:
+            report = self._ingest(
+                request=request,
+                schedule=schedule,
+                ingested_at=ingested_at,
+            )
+        except MarketDataError as error:
+            descriptor = error.code, dict(error.metadata)
+        except BaseException:
+            descriptor = MarketDataErrorCode.INTERNAL_CONTRACT, {}
+        self = None  # type: ignore[assignment]
+        request = None  # type: ignore[assignment]
+        schedule = None  # type: ignore[assignment]
+        ingested_at = None  # type: ignore[assignment]
+        if descriptor is not None:
+            code, metadata = descriptor
+            raise MarketDataError(code, metadata=metadata) from None
+        assert report is not None
+        return report
+
+    def _ingest(
         self,
         *,
         request: DailyBarRequest,
