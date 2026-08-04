@@ -331,10 +331,13 @@ Secret-safe exception construction:
 1. catch transport exceptions;
 2. inside the handler extract only a safe code and metadata;
 3. leave the `except` block;
-4. raise a newly constructed safe exception with no cause/context reference to the original;
-5. test the entire exception graph, args, attributes, repr, traceback, logs, provider repr/copy/pickle, verifier output, and tracked diff with a canary key.
+4. clear library-owned locals that contain target, response body, native payload, or native exception;
+5. raise a newly constructed safe exception with no cause/context reference to the original;
+6. test the exception object graph, args, attributes, repr, logs, provider repr/copy/pickle, verifier output, tracked diff, and every traceback frame owned by `stock_agent.data.providers` with canaries.
 
-Python string memory zeroization is not promised.
+Caller-owned traceback frames are outside this guarantee: the caller necessarily held the argument before invoking the provider, and a library must not mutate another frame's locals. No provider-owned traceback frame may retain the canary. Python string memory zeroization is not promised.
+
+`MarketDataError` domain fields (`code`, `retryable`, `metadata`, and `args`) are immutable after construction. Python interpreter-managed linkage fields (`__traceback__`, `__cause__`, `__context__`, and `__suppress_context__`) remain assignable so normal propagation, context managers, and traceback stripping work correctly; they are not domain payload.
 
 ## 9. Eastmoney wire contract
 

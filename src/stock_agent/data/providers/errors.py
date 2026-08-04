@@ -55,6 +55,9 @@ class MarketDataErrorCode(StrEnum):
 
 class MarketDataError(Exception):
     __slots__ = ("_frozen", "code", "metadata", "retryable")
+    _LINKAGE_ATTRIBUTES = frozenset(
+        {"__traceback__", "__cause__", "__context__", "__suppress_context__"}
+    )
 
     def __init__(
         self,
@@ -78,9 +81,20 @@ class MarketDataError(Exception):
         object.__setattr__(self, "_frozen", True)
 
     def __setattr__(self, name: str, value: object) -> None:
+        if name in self._LINKAGE_ATTRIBUTES:
+            BaseException.__setattr__(self, name, value)
+            return
         if getattr(self, "_frozen", False):
-            raise TypeError("market data errors are immutable")
+            raise TypeError("market data error domain payload is immutable")
         object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in self._LINKAGE_ATTRIBUTES:
+            BaseException.__delattr__(self, name)
+            return
+        if getattr(self, "_frozen", False):
+            raise TypeError("market data error domain payload is immutable")
+        object.__delattr__(self, name)
 
     def __repr__(self) -> str:
         return (

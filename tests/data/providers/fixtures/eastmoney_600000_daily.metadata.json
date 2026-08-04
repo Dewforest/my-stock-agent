@@ -1,0 +1,20 @@
+{
+  "provider_id": "eastmoney",
+  "retrieved_utc": "2026-08-04T09:00:29Z",
+  "request_parameters": {
+    "secid": "1.600000",
+    "beg": "20250701",
+    "end": "20250707",
+    "klt": "101",
+    "fqt": "0",
+    "fields1": "f1,f2,f3,f4,f5,f6",
+    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+  },
+  "source_type": "documentation-derived",
+  "transformations_redactions": [
+    "Constructed from the documented Eastmoney response shape after the permitted live request failed at DNS resolution.",
+    "Limited to five 600000 daily rows in the bounded 2025-07-01 through 2025-07-07 range.",
+    "No credentials, cookies, request headers, or user data were present or added."
+  ],
+  "fixture_sha256": "81e990b12db3ebe0e0c0fb70db4a4bac7a95a7fc572a1de208bd9c411c12b942"
+}
