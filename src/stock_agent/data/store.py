@@ -308,10 +308,13 @@ class PointInTimeStore:
         revisions: tuple[BarRevisionWrite, ...],
         *,
         enforce_single_provider: bool = True,
+        enforce_strict_stream_clock: bool = False,
     ) -> BatchAppendResult:
         self._ensure_open()
         if type(enforce_single_provider) is not bool:
             raise TypeError("enforce_single_provider must be exactly bool")
+        if type(enforce_strict_stream_clock) is not bool:
+            raise TypeError("enforce_strict_stream_clock must be exactly bool")
         if type(revisions) is not tuple or not revisions:
             raise ValueError("revisions must be a nonempty exact tuple")
         rebuilt: list[BarRevisionWrite] = []
@@ -406,6 +409,28 @@ class PointInTimeStore:
                         "conflicting payload for revision identity "
                         f"({write.source!r}, {write.source_record_id!r})"
                     )
+                if enforce_strict_stream_clock:
+                    latest_ingested_at = self._connection.execute(
+                        """
+                        SELECT ingested_at
+                        FROM bars
+                        WHERE source = ? AND market = ? AND symbol = ?
+                              AND session_date = ?
+                        ORDER BY ingested_at DESC, source_record_id DESC
+                        LIMIT 1
+                        """,
+                        [
+                            write.source,
+                            str(write.bar.market),
+                            write.bar.symbol,
+                            write.bar.session_date,
+                        ],
+                    ).fetchone()
+                    if (
+                        latest_ingested_at is not None
+                        and payload[9] <= latest_ingested_at[0]
+                    ):
+                        raise ValueError("ingestion clock conflict")
                 self._connection.execute(
                     """
                     INSERT INTO bars VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

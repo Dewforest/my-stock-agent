@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, Inexact, localcontext
+from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -585,6 +588,80 @@ def test_changed_observation_requires_strict_per_stream_clock(
         session_date=SESSION_DATES[0],
     )
     assert observed is not None and observed.bar.close == Decimal("100.5")
+
+
+def test_concurrent_changed_observation_rechecks_clock_in_write_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = str(tmp_path / "concurrent-ingestion.duckdb")
+    baseline_at = _instant(SESSION_DATES[-1], 22)
+    older_at = baseline_at + timedelta(minutes=1)
+    newer_at = baseline_at + timedelta(minutes=2)
+    with PointInTimeStore(database) as baseline_store:
+        _ingest(baseline_store, (_fetched(),), ingested_at=baseline_at)
+
+    older_store = PointInTimeStore(database)
+    newer_store = PointInTimeStore(database)
+    older_read_baseline = Event()
+    newer_committed = Event()
+    original_latest = older_store.latest_observed_bar_revision
+
+    def pause_older_after_read(**query: object) -> object:
+        result = original_latest(**query)  # type: ignore[arg-type]
+        older_read_baseline.set()
+        assert newer_committed.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        older_store,
+        "latest_observed_bar_revision",
+        pause_older_after_read,
+    )
+
+    def ingest_older() -> IngestionReport:
+        return _ingest(
+            older_store,
+            (_fetched(close=Decimal("100.75")),),
+            ingested_at=older_at,
+        )
+
+    def ingest_newer() -> IngestionReport:
+        assert older_read_baseline.wait(timeout=5)
+        try:
+            return _ingest(
+                newer_store,
+                (_fetched(close=Decimal("101.00")),),
+                ingested_at=newer_at,
+            )
+        finally:
+            newer_committed.set()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            older_future = executor.submit(ingest_older)
+            newer_future = executor.submit(ingest_newer)
+            assert newer_future.result(timeout=10).appended == 1
+            with pytest.raises(MarketDataError) as captured:
+                older_future.result(timeout=10)
+        assert captured.value.code is MarketDataErrorCode.CLOCK
+        before_newer = newer_store.latest_bar_revision_as_of(
+            market=Market.US,
+            symbol="AAPL",
+            session_date=SESSION_DATES[0],
+            as_of=older_at + timedelta(seconds=30),
+        )
+        latest = newer_store.latest_observed_bar_revision(
+            provider_id="alpha-vantage",
+            market=Market.US,
+            symbol="AAPL",
+            session_date=SESSION_DATES[0],
+        )
+        assert before_newer is not None and before_newer.bar.close == Decimal("100.5")
+        assert latest is not None and latest.bar.close == Decimal("101")
+    finally:
+        older_store.close()
+        newer_store.close()
 
 
 def test_second_provider_for_same_event_is_a_persistence_conflict() -> None:

@@ -414,13 +414,17 @@ class IncrementalBarIngestor:
         persistence_error: MarketDataError | None = None
         result = None
         try:
-            result = self._store.append_bar_revisions(candidates)
-        except BaseException as error:
-            code = (
-                MarketDataErrorCode.PERSISTENCE_CONFLICT
-                if type(error) is ValueError and "conflict" in str(error)
-                else MarketDataErrorCode.PERSISTENCE
+            result = self._store.append_bar_revisions(
+                candidates,
+                enforce_strict_stream_clock=True,
             )
+        except BaseException as error:
+            if type(error) is ValueError and str(error) == "ingestion clock conflict":
+                code = MarketDataErrorCode.CLOCK
+            elif type(error) is ValueError and "conflict" in str(error):
+                code = MarketDataErrorCode.PERSISTENCE_CONFLICT
+            else:
+                code = MarketDataErrorCode.PERSISTENCE
             persistence_error = MarketDataError(code)
         if persistence_error is not None:
             raise persistence_error from None
