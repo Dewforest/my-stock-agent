@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass, field
 from decimal import (
     MAX_EMAX,
     MAX_PREC,
@@ -19,10 +20,12 @@ from decimal import (
     localcontext,
 )
 
-from stock_agent.domain import Bar, Position, Side
+from stock_agent.domain import Bar, Position, Side, StrategyIntent
 from stock_agent.strategies.evidence import bar_evidence_id_for
 from stock_agent.strategies.llm_contract import (
     DecisionPhase,
+    LLMDecisionRecord,
+    LLMDecisionRequest,
     StrategyAActionTarget,
     StrategyACandidateEnvelope,
     StrategyAConfig,
@@ -30,10 +33,203 @@ from stock_agent.strategies.llm_contract import (
     StrategyARegime,
     candidate_id_for,
     portfolio_snapshot_id_for,
+    request_fingerprint_for,
 )
+from stock_agent.strategies.llm_provider import LLMDecisionProvider
 from stock_agent.strategies.protocol import StrategyContext
 
 STRATEGY_A_ID = "strategy-a-bounded-llm"
+_ADAPTER_ERROR = "Strategy A bounded decision failed"
+
+
+class StrategyAAdapterError(RuntimeError):
+    """Stable, secret-free failure at the bounded Strategy A decision boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedLLMStrategyA:
+    config: StrategyAConfig
+    provider: LLMDecisionProvider
+    model_identity_policy_id: str
+    prompt_template_id: str
+    prompt_template_digest: str
+    strategy_id: str = field(default=STRATEGY_A_ID, init=False)
+    config_version: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        validated = _exact_config(self.config)
+        if not isinstance(self.provider, LLMDecisionProvider):
+            raise TypeError("provider must satisfy LLMDecisionProvider")
+        provenance = (
+            self.model_identity_policy_id,
+            self.prompt_template_id,
+            self.prompt_template_digest,
+        )
+        if any(type(value) is not str for value in provenance) or provenance != (
+            validated.model_identity_policy_id,
+            validated.prompt_template_id,
+            validated.prompt_template_digest,
+        ):
+            raise ValueError("Strategy A constructor provenance must exactly match config")
+        object.__setattr__(self, "config_version", validated.config_version)
+
+    def evaluate(self, context: StrategyContext) -> tuple[StrategyIntent, ...]:
+        validated_config = _exact_config(self.config)
+        validated_context = _exact_strategy_context(context)
+        if (
+            self.strategy_id != STRATEGY_A_ID
+            or self.config_version != validated_config.config_version
+            or validated_context.strategy_config_version != validated_config.config_version
+        ):
+            raise ValueError("strategy context and Strategy A config versions do not match")
+        if (
+            self.model_identity_policy_id != validated_config.model_identity_policy_id
+            or self.prompt_template_id != validated_config.prompt_template_id
+            or self.prompt_template_digest != validated_config.prompt_template_digest
+        ):
+            raise ValueError("Strategy A adapter provenance does not match config")
+
+        candidates = build_strategy_a_candidates(validated_context, validated_config)
+        if not candidates:
+            return ()
+
+        request = _request_for(validated_context, validated_config, candidates)
+        try:
+            record = _exact_record(self.provider.decide(request))
+            _require_record_matches_request(record, request)
+            return _intents_for(record, request)
+        except Exception:
+            raise StrategyAAdapterError(_ADAPTER_ERROR) from None
+
+
+def _exact_strategy_context(context: object) -> StrategyContext:
+    if type(context) is not StrategyContext:
+        raise TypeError("context must be an exact StrategyContext")
+    if set(context.__dict__) != set(StrategyContext.model_fields):
+        raise ValueError("StrategyContext is polluted")
+    values = {name: getattr(context, name) for name in StrategyContext.model_fields}
+    with localcontext(_context_validation_context(context)):
+        return StrategyContext.model_validate(values, strict=True)
+
+
+def _context_validation_context(context: StrategyContext) -> Context:
+    portfolio = context.portfolio
+    values = (
+        portfolio.cash,
+        portfolio.nav,
+        portfolio.peak_nav,
+        *(position.market_value for position in portfolio.positions),
+    )
+    max_digits = max(len(value.as_tuple().digits) for value in values)
+    precision = max_digits + len(str(len(portfolio.positions) + 1)) + 2
+    return Context(
+        prec=min(MAX_PREC, max(50, precision)),
+        rounding=ROUND_HALF_EVEN,
+        Emin=MIN_EMIN,
+        Emax=MAX_EMAX,
+    )
+
+
+def _exact_config(config: object) -> StrategyAConfig:
+    if type(config) is not StrategyAConfig:
+        raise TypeError("config must be an exact StrategyAConfig")
+    if set(config.__dict__) != set(StrategyAConfig.model_fields):
+        raise ValueError("StrategyAConfig is polluted")
+    values = {name: getattr(config, name) for name in StrategyAConfig.model_fields}
+    return StrategyAConfig.model_validate(values, strict=True)
+
+
+def _request_for(
+    context: StrategyContext,
+    config: StrategyAConfig,
+    candidates: tuple[StrategyACandidateEnvelope, ...],
+) -> LLMDecisionRequest:
+    values = {
+        "schema_version": "llm-decision-request/v1",
+        "strategy_id": STRATEGY_A_ID,
+        "config_version": config.config_version,
+        "market": context.market_snapshot.market,
+        "as_of": context.market_snapshot.as_of,
+        "decision_phase": DecisionPhase.POST_CLOSE,
+        "model_identity_policy_id": config.model_identity_policy_id,
+        "prompt_template_id": config.prompt_template_id,
+        "prompt_template_digest": config.prompt_template_digest,
+        "candidates": candidates,
+    }
+    provisional = LLMDecisionRequest.model_construct(
+        **values,
+        request_fingerprint="llm-decision-request-sha256:" + "0" * 64,
+    )
+    return LLMDecisionRequest(
+        **values,
+        request_fingerprint=request_fingerprint_for(provisional),
+    )
+
+
+def _exact_record(record: object) -> LLMDecisionRecord:
+    if type(record) is not LLMDecisionRecord:
+        raise TypeError("provider must return an exact LLMDecisionRecord")
+    if set(record.__dict__) != set(LLMDecisionRecord.model_fields):
+        raise ValueError("LLMDecisionRecord is polluted")
+    values = {name: getattr(record, name) for name in LLMDecisionRecord.model_fields}
+    return LLMDecisionRecord.model_validate(values, strict=True)
+
+
+def _require_record_matches_request(
+    record: LLMDecisionRecord,
+    request: LLMDecisionRequest,
+) -> None:
+    if (
+        record.request_fingerprint != request.request_fingerprint
+        or record.config_version != request.config_version
+        or record.model_identity_policy_id != request.model_identity_policy_id
+        or record.prompt_template_id != request.prompt_template_id
+        or record.prompt_template_digest != request.prompt_template_digest
+    ):
+        raise ValueError("decision provenance does not match request")
+    if tuple(selection.symbol for selection in record.selections) != tuple(
+        candidate.symbol for candidate in request.candidates
+    ):
+        raise ValueError("decision candidates do not match request")
+    if any(
+        selection.action not in {target.action for target in candidate.action_targets}
+        for selection, candidate in zip(record.selections, request.candidates, strict=True)
+    ):
+        raise ValueError("decision action violates candidate envelope")
+
+
+def _intents_for(
+    record: LLMDecisionRecord,
+    request: LLMDecisionRequest,
+) -> tuple[StrategyIntent, ...]:
+    intents = []
+    for selection, candidate in zip(record.selections, request.candidates, strict=True):
+        targets = {item.action: item.target_weight for item in candidate.action_targets}
+        evidence_ids = tuple(
+            sorted(
+                {
+                    *candidate.evidence_ids,
+                    candidate.portfolio_snapshot_id,
+                    candidate.candidate_id,
+                    record.decision_id,
+                }
+            )
+        )
+        intents.append(
+            StrategyIntent(
+                strategy_id=STRATEGY_A_ID,
+                symbol=selection.symbol,
+                market=request.market,
+                side=selection.action,
+                target_weight=targets[selection.action],
+                confidence=selection.confidence,
+                as_of=request.as_of,
+                thesis=selection.thesis,
+                invalidation=selection.invalidation,
+                evidence_ids=evidence_ids,
+            )
+        )
+    return tuple(intents)
 
 
 def build_strategy_a_candidates(

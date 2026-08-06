@@ -151,6 +151,7 @@ def test_public_identity_protocol_slots_and_frozen_configuration() -> None:
     strategy = MovingAverageFixtureStrategy()
 
     assert strategies.__all__ == [
+        "BoundedLLMStrategyA",
         "MarketSnapshot",
         "MovingAverageFixtureStrategy",
         "Strategy",
