@@ -359,7 +359,7 @@ def test_canonical_helpers_match_independently_built_literal_json_bytes() -> Non
     assert portfolio_snapshot_id_for(portfolio) == expected_portfolio_id
 
 
-def test_portfolio_snapshot_helper_requires_exact_revalidated_symbol_sorted_input() -> None:
+def test_portfolio_snapshot_helper_revalidates_and_canonicalizes_position_order() -> None:
     aapl = Position(
         symbol="AAPL",
         quantity=Decimal("1"),
@@ -381,8 +381,18 @@ def test_portfolio_snapshot_helper_requires_exact_revalidated_symbol_sorted_inpu
         positions=(ibm, aapl),
         as_of=AS_OF,
     )
-    with pytest.raises(ValueError, match="symbol-sorted"):
-        portfolio_snapshot_id_for(unsorted)
+    sorted_snapshot = PortfolioSnapshot(
+        account_id="account-1",
+        market=Market.US,
+        cash=Decimal("900"),
+        nav=Decimal("1000"),
+        peak_nav=Decimal("1000"),
+        positions=(aapl, ibm),
+        as_of=AS_OF,
+    )
+    assert portfolio_snapshot_id_for(unsorted) == portfolio_snapshot_id_for(
+        sorted_snapshot
+    )
 
     polluted = PortfolioSnapshot.model_construct(
         account_id="account-1",

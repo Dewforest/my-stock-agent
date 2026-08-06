@@ -403,9 +403,7 @@ def portfolio_snapshot_id_for(snapshot: PortfolioSnapshot) -> str:
     if type(snapshot.positions) is not tuple:
         raise ValueError("portfolio positions must be an exact tuple")
     snapshot = PortfolioSnapshot.model_validate(snapshot)
-    symbols = tuple(item.symbol for item in snapshot.positions)
-    if symbols != tuple(sorted(symbols)):
-        raise ValueError("portfolio positions must be symbol-sorted")
+    positions = tuple(sorted(snapshot.positions, key=lambda item: item.symbol))
     return tagged_sha256(
         "portfolio-snapshot",
         (
@@ -422,7 +420,7 @@ def portfolio_snapshot_id_for(snapshot: PortfolioSnapshot) -> str:
                     canonical_decimal(item.average_cost),
                     canonical_decimal(item.market_value),
                 ]
-                for item in snapshot.positions
+                for item in positions
             ],
         ),
     )

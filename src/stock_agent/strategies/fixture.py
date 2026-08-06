@@ -20,8 +20,8 @@ from decimal import (
 )
 from itertools import zip_longest
 
-from stock_agent.audit import canonical_datetime, canonical_decimal, tagged_sha256
 from stock_agent.domain import Bar, Side, StrategyIntent
+from stock_agent.strategies.evidence import bar_evidence_id_for
 from stock_agent.strategies.protocol import StrategyContext
 
 
@@ -77,7 +77,7 @@ class MovingAverageFixtureStrategy:
                     as_of=context.market_snapshot.as_of,
                     thesis="Deterministic 2/3 moving-average fixture signal",
                     invalidation="A later point-in-time snapshot changes the fixture signal",
-                    evidence_ids=tuple(_bar_evidence_id(item) for item in used_bars),
+                    evidence_ids=tuple(bar_evidence_id_for(item) for item in used_bars),
                 )
             )
         return tuple(intents)
@@ -193,18 +193,3 @@ def _compare_tenfold_to_decimal(left: Decimal, right: Decimal) -> int:
         if left_digit != right_digit:
             return (left_digit > right_digit) - (left_digit < right_digit)
     return 0
-
-
-def _bar_evidence_id(item: Bar) -> str:
-    payload = (
-        item.market.value,
-        item.symbol,
-        item.session_date.isoformat(),
-        canonical_decimal(item.open),
-        canonical_decimal(item.high),
-        canonical_decimal(item.low),
-        canonical_decimal(item.close),
-        canonical_decimal(item.volume),
-        canonical_datetime(item.available_at),
-    )
-    return tagged_sha256("bar", payload)
