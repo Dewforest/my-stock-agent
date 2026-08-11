@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Run Ruff
+        run: uv run ruff check .
+
+      - name: Reject whitespace errors
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+          EMPTY_TREE_SHA: 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+        run: |
+          case "$EVENT_NAME" in
+            pull_request)
+              git diff --check "$BASE_SHA...$HEAD_SHA"
+              ;;
+            push)
+              start_sha="$BEFORE_SHA"
+              if [ "$start_sha" = "0000000000000000000000000000000000000000" ] || \
+                 ! git cat-file -e "$start_sha^{commit}"; then
+                start_sha="$EMPTY_TREE_SHA"
+              fi
+              git diff --check "$start_sha...$CURRENT_SHA"
+              ;;
+            workflow_dispatch)
+              git diff --check "$EMPTY_TREE_SHA...$CURRENT_SHA"
+              ;;
+            *)
+              echo "unsupported event: $EVENT_NAME" >&2
+              exit 2
+              ;;
+          esac
