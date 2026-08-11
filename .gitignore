@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.duckdb
+*.duckdb.wal
+.env
+.env.*
+*.env
+!.env.example
+!.env.template
+.DS_Store
