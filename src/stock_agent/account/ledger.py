@@ -328,6 +328,7 @@ _ARITHMETIC_CONTEXT = Context(
     flags=[],
     traps=[InvalidOperation, DivisionByZero, Overflow, Underflow],
 )
+_PUBLIC_DECIMAL_QUANTUM = Decimal("1E-12")
 
 
 class _Lot:
@@ -597,7 +598,13 @@ class PortfolioLedger:
                 )
 
         assert cash is not None and snapshot is not None
-        return cash, realized_pnl, positions, self._public_lots(holdings), snapshot
+        return (
+            cash,
+            self._public_decimal(realized_pnl, context),
+            positions,
+            self._public_lots(holdings),
+            snapshot,
+        )
 
     @classmethod
     def _apply_buy(
@@ -706,6 +713,11 @@ class PortfolioLedger:
     def _require_finite(*values: Decimal) -> None:
         if not all(value.is_finite() for value in values):
             raise ValueError("decimal arithmetic must remain finite")
+
+    @staticmethod
+    def _public_decimal(value: Decimal, context: Context) -> Decimal:
+        rounded = context.quantize(value, _PUBLIC_DECIMAL_QUANTUM)
+        return value if rounded == value else rounded
 
     @staticmethod
     def _public_positions(

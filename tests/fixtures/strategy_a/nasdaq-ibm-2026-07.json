@@ -1,0 +1,91 @@
+{
+  "schema_version": "strategy-a-provider-fixture/v1",
+  "provider_id": "nasdaq-historical",
+  "provider_schema": "nasdaq-historical/v1",
+  "source_host": "api.nasdaq.com",
+  "source_path": "/api/quote/IBM/historical",
+  "request_parameters": {
+    "assetclass": "stocks",
+    "fromdate": "2026-07-20",
+    "todate": "2026-08-05",
+    "limit": "30"
+  },
+  "observed_at_utc": "2026-08-06T10:47:22Z",
+  "response_total_records": 13,
+  "normalized_response_digest": "nasdaq-normalized-response-sha256:ec762718b31542917a01572c99f1994df0371f7c6b10fcae131f6481371ff0eb",
+  "selection_policy": "minimal-contiguous-window-with-natural-offensive-signal/v1",
+  "selection_start": "2026-07-24",
+  "selection_end": "2026-07-30",
+  "market": "US",
+  "symbol": "IBM",
+  "currency": "USD",
+  "sector": "Technology",
+  "timezone": "America/New_York",
+  "open_time": "09:30:00",
+  "close_time": "16:00:00",
+  "pit_knowledge_policy": "current-view-baseline/v1",
+  "market_data_price_policy": "raw-unadjusted/no-corporate-actions/v1",
+  "dataset_digest": "dataset-sha256:5183efd941801b2aacba9fcf7aa8a01425a79845218f5c8bfad0ef62e83128f6",
+  "response_rows": [
+    {"date": "08/05/2026", "close": "$235.92", "volume": "5,726,854", "open": "$236.10", "high": "$238.9627", "low": "$233.46"},
+    {"date": "08/04/2026", "close": "$235.15", "volume": "7,537,896", "open": "$224.76", "high": "$235.31", "low": "$223.30"},
+    {"date": "08/03/2026", "close": "$226.31", "volume": "7,974,681", "open": "$228.33", "high": "$228.55", "low": "$224.87"},
+    {"date": "07/31/2026", "close": "$223.65", "volume": "9,093,613", "open": "$221.15", "high": "$224.76", "low": "$216.585"},
+    {"date": "07/30/2026", "close": "$221.74", "volume": "9,675,157", "open": "$222.00", "high": "$224.86", "low": "$220.20"},
+    {"date": "07/29/2026", "close": "$226.44", "volume": "8,806,699", "open": "$227.70", "high": "$230.97", "low": "$223.95"},
+    {"date": "07/28/2026", "close": "$227.55", "volume": "13,262,960", "open": "$219.73", "high": "$228.98", "low": "$215.1101"},
+    {"date": "07/27/2026", "close": "$216.28", "volume": "8,369,433", "open": "$217.75", "high": "$219.63", "low": "$215.29"},
+    {"date": "07/24/2026", "close": "$214.19", "volume": "10,578,780", "open": "$209.28", "high": "$216.10", "low": "$206.80"},
+    {"date": "07/23/2026", "close": "$206.65", "volume": "15,306,010", "open": "$202.64", "high": "$207.55", "low": "$199.19"},
+    {"date": "07/22/2026", "close": "$205.77", "volume": "14,606,740", "open": "$207.68", "high": "$212.3417", "low": "$204.73"},
+    {"date": "07/21/2026", "close": "$210.50", "volume": "11,954,410", "open": "$210.72", "high": "$214.97", "low": "$209.18"},
+    {"date": "07/20/2026", "close": "$213.00", "volume": "9,585,016", "open": "$210.07", "high": "$216.2762", "low": "$208.82"}
+  ],
+  "rows": [
+    {
+      "date": "2026-07-24",
+      "open": "209.28",
+      "high": "216.10",
+      "low": "206.80",
+      "close": "214.19",
+      "volume": "10578780",
+      "source_record_id": "provider-payload-sha256:a5ba707d77a42f1c983a499a06a0cbae694ecc891fb4068be144198052fe71c4"
+    },
+    {
+      "date": "2026-07-27",
+      "open": "217.75",
+      "high": "219.63",
+      "low": "215.29",
+      "close": "216.28",
+      "volume": "8369433",
+      "source_record_id": "provider-payload-sha256:c626226d66f5ffbd0cb07c0eaf12f2d4324bf25776fb3c1af04f754fa11643e9"
+    },
+    {
+      "date": "2026-07-28",
+      "open": "219.73",
+      "high": "228.98",
+      "low": "215.1101",
+      "close": "227.55",
+      "volume": "13262960",
+      "source_record_id": "provider-payload-sha256:6349c31db3f2e70ba44c3803848a78c8e33c0f7433ed00bd52484a91f98ea46e"
+    },
+    {
+      "date": "2026-07-29",
+      "open": "227.70",
+      "high": "230.97",
+      "low": "223.95",
+      "close": "226.44",
+      "volume": "8806699",
+      "source_record_id": "provider-payload-sha256:75907f19e58f9c994217ec5142ea2ff23764cb9068f505b31f2974f08c80608f"
+    },
+    {
+      "date": "2026-07-30",
+      "open": "222.00",
+      "high": "224.86",
+      "low": "220.20",
+      "close": "221.74",
+      "volume": "9675157",
+      "source_record_id": "provider-payload-sha256:00207900fad507e6ed817b2aeb9212c2051faeb057a6fdd3ba2ea00588ccb982"
+    }
+  ]
+}

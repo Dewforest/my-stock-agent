@@ -155,6 +155,27 @@ def test_partial_sell_allocates_fifo_cost_and_fees_against_realized_pnl() -> Non
     assert ledger.snapshot().peak_nav == Decimal("1037")
 
 
+def test_fractional_partial_sell_rounds_public_realized_pnl_to_ledger_boundary() -> None:
+    ledger = initialized_ledger()
+    ledger.append(
+        buy_event(
+            quantity=Decimal("3"),
+            price=Decimal("10"),
+            fees=Decimal("0.1"),
+        )
+    )
+
+    ledger.append(
+        sell_event(
+            quantity=Decimal("1"),
+            price=Decimal("9"),
+            fees=Decimal("0"),
+        )
+    )
+
+    assert ledger.realized_pnl == Decimal("-1.033333333333")
+
+
 def test_partial_sell_uses_fifo_and_preserves_remaining_acquisition_lots() -> None:
     ledger = initialized_ledger()
     ledger.append(

@@ -78,6 +78,7 @@ def context_values(**overrides: object) -> dict[str, object]:
 
 def test_public_protocol_exports_are_available() -> None:
     assert strategies.__all__ == [
+        "BoundedLLMStrategyA",
         "MarketSnapshot",
         "MovingAverageFixtureStrategy",
         "Strategy",
