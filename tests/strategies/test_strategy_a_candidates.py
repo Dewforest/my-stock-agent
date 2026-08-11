@@ -280,4 +280,3 @@ def test_candidate_builder_rejects_config_version_mismatch() -> None:
             context(bar(28, "10", "100")),
             config(config_version="other"),
         )
-

@@ -505,4 +505,3 @@ def _weight_context(market_value: Decimal, nav: Decimal) -> Context:
     for signal in (Clamped, FloatOperation, Inexact, Rounded, Subnormal, Underflow):
         context.traps[signal] = False
     return context
-
