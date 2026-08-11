@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Protocol
 
 from stock_agent.strategies.llm_contract import LLMDecisionRequest
@@ -22,6 +23,13 @@ SYSTEM_PROMPT = (
 )
 PROMPT_TEMPLATE_DIGEST = "prompt-sha256:" + hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest()
 _MAX_TOKENS = 1_000_000
+
+
+class OpenAICompatibleResponseError(Exception):
+    """Stable failure for a malformed OpenAI-compatible provider envelope."""
+
+    def __init__(self) -> None:
+        super().__init__("OpenAI-compatible provider response rejected")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +102,18 @@ class OpenAICompatibleChatTransport:
             target=self.profile.target,
             body=body,
         )
-        raise NotImplementedError(response)
+        result = _parse_provider_response(response)
+        response = None  # type: ignore[assignment]
+        payload, response_id, returned_model = result
+        result = None  # type: ignore[assignment]
+        if payload is None or response_id is None or returned_model is None:
+            raise OpenAICompatibleResponseError() from None
+        payload["provider_response_id"] = response_id
+        return RawLLMResponse(
+            payload=payload,
+            model_identity=returned_model,
+            model_revision=f"api-model-id:{returned_model}",
+        )
 
 
 def _verify_prompt(request: LLMDecisionRequest) -> None:
@@ -115,12 +134,77 @@ def _canonical_json(value: object) -> bytes:
     ).encode()
 
 
+def _parse_provider_response(
+    response: object,
+) -> tuple[dict[str, object] | None, str | None, str | None]:
+    try:
+        raw = _strict_json_bytes(response)
+        if type(raw) is not dict:
+            raise ValueError
+        response_id = raw["id"]
+        returned_model = raw["model"]
+        choices = raw["choices"]
+        if (
+            type(response_id) is not str
+            or not response_id.strip()
+            or type(returned_model) is not str
+            or not returned_model.strip()
+            or type(choices) is not list
+            or len(choices) != 1
+        ):
+            raise ValueError
+        choice = choices[0]
+        if type(choice) is not dict or choice.get("finish_reason") != "stop":
+            raise ValueError
+        message = choice["message"]
+        if type(message) is not dict or message.get("role") != "assistant":
+            raise ValueError
+        content = message["content"]
+        if type(content) is not str or not content.strip():
+            raise ValueError
+        payload = _strict_json_text(content)
+        if type(payload) is not dict or "provider_response_id" in payload:
+            raise ValueError
+        return payload, response_id, returned_model
+    except (KeyError, TypeError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None, None, None
+
+
+def _strict_json_bytes(value: object) -> object:
+    if type(value) is not bytes or value.startswith(b"\xef\xbb\xbf"):
+        raise ValueError
+    return _strict_json_text(value.decode("utf-8"))
+
+
+def _strict_json_text(value: str) -> object:
+    return json.loads(
+        value,
+        object_pairs_hook=_unique_object,
+        parse_float=Decimal,
+        parse_constant=_reject_constant,
+    )
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def _reject_constant(value: str) -> object:
+    raise ValueError
+
+
 __all__ = [
     "PROMPT_TEMPLATE_DIGEST",
     "PROMPT_TEMPLATE_ID",
     "SYSTEM_PROMPT",
     "OpenAICompatibleChatTransport",
     "OpenAICompatibleProfile",
+    "OpenAICompatibleResponseError",
     "deepseek_chat_profile",
     "openai_chat_profile",
 ]

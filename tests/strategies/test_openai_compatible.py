@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -19,11 +19,19 @@ from stock_agent.strategies.llm_contract import (
     candidate_id_for,
     request_fingerprint_for,
 )
+from stock_agent.strategies.llm_journal import LLMDecisionJournal
+from stock_agent.strategies.llm_provider import (
+    ExactModelIdentityPolicy,
+    InvocationStart,
+    RecordedLLMDecisionProvider,
+    ReplayLLMDecisionProvider,
+)
 from stock_agent.strategies.openai_compatible import (
     PROMPT_TEMPLATE_DIGEST,
     PROMPT_TEMPLATE_ID,
     SYSTEM_PROMPT,
     OpenAICompatibleChatTransport,
+    OpenAICompatibleResponseError,
     deepseek_chat_profile,
     openai_chat_profile,
 )
@@ -197,3 +205,175 @@ def test_prompt_mismatch_rejected_before_http_collaborator() -> None:
     with pytest.raises(ValueError, match="prompt contract mismatch"):
         transport.invoke(invalid)
     assert http.calls == []
+
+
+def _model_payload(request: LLMDecisionRequest) -> dict[str, object]:
+    return {
+        "schema_version": "llm-decision-response/v1",
+        "request_fingerprint": request.request_fingerprint,
+        "selections": [
+            {
+                "symbol": "IBM",
+                "action": "BUY",
+                "confidence": 82,
+                "thesis": "Trend and volume agree",
+                "invalidation": "Trend breaks",
+            }
+        ],
+    }
+
+
+def _provider_response(
+    request: LLMDecisionRequest,
+    *,
+    content: object | None = None,
+    response_id: object = "chatcmpl-authoritative",
+    model: object = "gpt-returned",
+) -> bytes:
+    return json.dumps(
+        {
+            "id": response_id,
+            "model": model,
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(_model_payload(request))
+                        if content is None
+                        else content,
+                    },
+                }
+            ],
+            "created": 123,
+            "provider_additive_field": {"safe": True},
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def test_invoke_extracts_strict_envelope_and_injects_authoritative_id() -> None:
+    request = _request()
+    http = HttpSpy(_provider_response(request))
+    transport = OpenAICompatibleChatTransport(
+        profile=openai_chat_profile(model="gpt-requested", max_tokens=321),
+        http_client=http,
+    )
+
+    raw = transport.invoke(request)
+
+    assert raw.model_identity == "gpt-returned"
+    assert raw.model_revision == "api-model-id:gpt-returned"
+    assert raw.payload == {
+        **_model_payload(request),
+        "provider_response_id": "chatcmpl-authoritative",
+    }
+    assert len(http.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        b"\xef\xbb\xbf{}",
+        b"\xff",
+        b'{"id":"a","id":"b"}',
+        b'{"value":NaN}',
+        b"{} trailing",
+        b"[]",
+        b"{}",
+    ],
+)
+def test_provider_envelope_bytes_and_json_are_strict(response: bytes) -> None:
+    transport = OpenAICompatibleChatTransport(
+        profile=openai_chat_profile(model="gpt", max_tokens=1),
+        http_client=HttpSpy(response),
+    )
+    with pytest.raises(OpenAICompatibleResponseError, match="provider response rejected"):
+        transport.invoke(_request())
+
+
+def _mutated_provider_response(request: LLMDecisionRequest, mutation: Any) -> bytes:
+    raw = json.loads(_provider_response(request))
+    mutation(raw)
+    return json.dumps(raw, separators=(",", ":")).encode()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda raw: raw.update(id=""),
+        lambda raw: raw.update(id=1),
+        lambda raw: raw.update(model=" "),
+        lambda raw: raw.update(model=1),
+        lambda raw: raw.update(choices=[]),
+        lambda raw: raw["choices"].append(raw["choices"][0]),
+        lambda raw: raw["choices"][0].update(finish_reason="length"),
+        lambda raw: raw["choices"][0]["message"].update(role="tool"),
+        lambda raw: raw["choices"][0]["message"].update(content=" "),
+        lambda raw: raw["choices"][0]["message"].update(content=1),
+    ],
+)
+def test_admitted_provider_fields_remain_exact(mutation: Any) -> None:
+    request = _request()
+    response = _mutated_provider_response(request, mutation)
+    transport = OpenAICompatibleChatTransport(
+        profile=openai_chat_profile(model="gpt", max_tokens=1),
+        http_client=HttpSpy(response),
+    )
+    with pytest.raises(OpenAICompatibleResponseError):
+        transport.invoke(request)
+
+
+def test_model_content_cannot_claim_provider_response_id() -> None:
+    request = _request()
+    payload = {**_model_payload(request), "provider_response_id": "model-forged"}
+    response = _provider_response(request, content=json.dumps(payload))
+    transport = OpenAICompatibleChatTransport(
+        profile=openai_chat_profile(model="gpt", max_tokens=1),
+        http_client=HttpSpy(response),
+    )
+    with pytest.raises(OpenAICompatibleResponseError):
+        transport.invoke(request)
+
+
+class _Boundary:
+    def begin(self) -> InvocationStart:
+        return InvocationStart(attempt_id="openai-compatible-attempt-1", started_at=NOW)
+
+    def end_at(self, invocation: InvocationStart) -> datetime:
+        return invocation.started_at + timedelta(seconds=1)
+
+
+def test_real_record_provider_atomically_journals_then_replays_without_http() -> None:
+    request = _request()
+    http = HttpSpy(_provider_response(request))
+    transport = OpenAICompatibleChatTransport(
+        profile=openai_chat_profile(model="gpt-requested", max_tokens=321),
+        http_client=http,
+    )
+    policy = ExactModelIdentityPolicy(
+        policy_id=request.model_identity_policy_id,
+        model_identity="gpt-returned",
+        model_revision="api-model-id:gpt-returned",
+    )
+
+    with LLMDecisionJournal() as journal:
+        recorded = RecordedLLMDecisionProvider(
+            transport=transport,
+            journal=journal,
+            model_policy=policy,
+            invocation_boundary=_Boundary(),
+        ).decide(request)
+        attempts = journal.list_attempts()
+        decisions = journal.list_decisions()
+        replayed = ReplayLLMDecisionProvider(
+            journal=journal,
+            model_policy=policy,
+        ).decide(request)
+
+        assert recorded.provider_response_id == "chatcmpl-authoritative"
+        assert attempts[0].provider_response_id == "chatcmpl-authoritative"
+        assert decisions == (recorded,)
+        assert replayed == recorded
+        assert journal.list_attempts() == attempts
+        assert len(http.calls) == 1
