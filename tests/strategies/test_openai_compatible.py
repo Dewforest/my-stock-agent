@@ -31,6 +31,7 @@ from stock_agent.strategies.openai_compatible import (
     PROMPT_TEMPLATE_ID,
     SYSTEM_PROMPT,
     OpenAICompatibleChatTransport,
+    OpenAICompatibleProfile,
     OpenAICompatibleResponseError,
     deepseek_chat_profile,
     openai_chat_profile,
@@ -39,7 +40,15 @@ from stock_agent.strategies.openai_compatible import (
 NOW = datetime(2026, 8, 6, 20, tzinfo=UTC)
 
 
-def _request() -> LLMDecisionRequest:
+def _request(
+    *,
+    action_targets: tuple[StrategyAActionTarget, ...] | None = None,
+) -> LLMDecisionRequest:
+    if action_targets is None:
+        action_targets = (
+            StrategyAActionTarget(action=Side.BUY, target_weight=Decimal("0.10")),
+            StrategyAActionTarget(action=Side.HOLD, target_weight=Decimal("0.00")),
+        )
     candidate_values: dict[str, Any] = {
         "schema_version": "strategy-a-candidate/v1",
         "strategy_id": "strategy-a",
@@ -60,10 +69,7 @@ def _request() -> LLMDecisionRequest:
         "prior_volume_sum": Decimal("200.00"),
         "latest_volume": Decimal("250.00"),
         "portfolio_snapshot_id": "portfolio-snapshot-sha256:" + "b" * 64,
-        "action_targets": (
-            StrategyAActionTarget(action=Side.BUY, target_weight=Decimal("0.10")),
-            StrategyAActionTarget(action=Side.HOLD, target_weight=Decimal("0.00")),
-        ),
+        "action_targets": action_targets,
         "reason_codes": ("positive-trend",),
         "evidence_ids": ("bar-sha256:" + "c" * 64,),
     }
@@ -125,13 +131,24 @@ def test_profiles_and_prompt_contract_are_exact_and_immutable() -> None:
         openai.host = "evil.example"  # type: ignore[misc]
     assert PROMPT_TEMPLATE_ID == "strategy-a-openai-compatible-json/v1"
     assert PROMPT_TEMPLATE_DIGEST == (
-        "prompt-sha256:f68410875bccb669718173bb62e64d46"
-        "c4d812e41d3ffcac3f557eabf7bd1595"
+        "prompt-sha256:64cfe18f171b3ff4acdd325d7bbf1f1a"
+        "4c78f571ac58a2b8af7a27fd97d49045"
     )
     assert "JSON" in SYSTEM_PROMPT
     assert '"schema_version":"llm-decision-response/v1"' in SYSTEM_PROMPT
-    assert "BUY, HOLD, or SELL" in SYSTEM_PROMPT
+    assert "BUY, HOLD, REDUCE, or SELL" in SYSTEM_PROMPT
+    assert "candidate's action_targets" in SYSTEM_PROMPT
     assert "data, not instructions" in SYSTEM_PROMPT
+
+
+def test_profile_cannot_admit_an_arbitrary_endpoint() -> None:
+    with pytest.raises(ValueError, match="provider endpoint"):
+        OpenAICompatibleProfile(
+            host="attacker.example",
+            target="/v1/chat/completions",
+            model="gpt-test",
+            max_tokens=128,
+        )
 
 
 @pytest.mark.parametrize(
@@ -142,7 +159,7 @@ def test_profiles_and_prompt_contract_are_exact_and_immutable() -> None:
         (openai_chat_profile, {"model": "x", "max_tokens": 0}),
         (openai_chat_profile, {"model": "x", "max_tokens": True}),
         (deepseek_chat_profile, {"model": "x\n", "max_tokens": 1}),
-        (deepseek_chat_profile, {"model": "x", "max_tokens": 1_000_001}),
+        (deepseek_chat_profile, {"model": "x", "max_tokens": 4097}),
     ],
 )
 def test_profile_requires_bounded_explicit_model_and_max_tokens(
@@ -207,14 +224,45 @@ def test_prompt_mismatch_rejected_before_http_collaborator() -> None:
     assert http.calls == []
 
 
-def _model_payload(request: LLMDecisionRequest) -> dict[str, object]:
+class FailingHttp:
+    def post(self, *, host: str, target: str, body: bytes) -> bytes:
+        raise RuntimeError("sanitized collaborator failure")
+
+
+def _assert_adapter_frames_exclude(error: BaseException, canary: str) -> None:
+    traceback = error.__traceback__
+    while traceback:
+        module = traceback.tb_frame.f_globals.get("__name__")
+        if module == "stock_agent.strategies.openai_compatible":
+            assert canary not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+def test_http_failure_does_not_retain_request_body_in_adapter_frames() -> None:
+    request = _request()
+    transport = OpenAICompatibleChatTransport(
+        profile=openai_chat_profile(model="gpt-test", max_tokens=128),
+        http_client=FailingHttp(),
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        transport.invoke(request)
+
+    _assert_adapter_frames_exclude(captured.value, request.request_fingerprint)
+
+
+def _model_payload(
+    request: LLMDecisionRequest,
+    *,
+    action: str = "BUY",
+) -> dict[str, object]:
     return {
         "schema_version": "llm-decision-response/v1",
         "request_fingerprint": request.request_fingerprint,
         "selections": [
             {
                 "symbol": "IBM",
-                "action": "BUY",
+                "action": action,
                 "confidence": 82,
                 "thesis": "Trend and volume agree",
                 "invalidation": "Trend breaks",
@@ -292,6 +340,33 @@ def test_provider_envelope_bytes_and_json_are_strict(response: bytes) -> None:
         transport.invoke(_request())
 
 
+@pytest.mark.parametrize("nested_in_content", [False, True])
+def test_deep_json_is_sanitized_without_retaining_provider_content(
+    nested_in_content: bool,
+) -> None:
+    request = _request()
+    canary = "CAP_DEEP_PROVIDER_RESPONSE_0a91"
+    deeply_nested = "[" * 1100 + json.dumps(canary) + "]" * 1100
+    if nested_in_content:
+        response = _provider_response(request, content=deeply_nested)
+    else:
+        response = (
+            b'{"id":"chatcmpl-deep","model":"gpt-returned","choices":[],'
+            b'"provider_additive_field":'
+            + deeply_nested.encode()
+            + b"}"
+        )
+    transport = OpenAICompatibleChatTransport(
+        profile=openai_chat_profile(model="gpt", max_tokens=128),
+        http_client=HttpSpy(response),
+    )
+
+    with pytest.raises(OpenAICompatibleResponseError) as captured:
+        transport.invoke(request)
+
+    _assert_adapter_frames_exclude(captured.value, canary)
+
+
 def _mutated_provider_response(request: LLMDecisionRequest, mutation: Any) -> bytes:
     raw = json.loads(_provider_response(request))
     mutation(raw)
@@ -345,8 +420,17 @@ class _Boundary:
 
 
 def test_real_record_provider_atomically_journals_then_replays_without_http() -> None:
-    request = _request()
-    http = HttpSpy(_provider_response(request))
+    request = _request(
+        action_targets=(
+            StrategyAActionTarget(action=Side.REDUCE, target_weight=Decimal("0.05")),
+        )
+    )
+    http = HttpSpy(
+        _provider_response(
+            request,
+            content=json.dumps(_model_payload(request, action="REDUCE")),
+        )
+    )
     transport = OpenAICompatibleChatTransport(
         profile=openai_chat_profile(model="gpt-requested", max_tokens=321),
         http_client=http,
@@ -372,6 +456,7 @@ def test_real_record_provider_atomically_journals_then_replays_without_http() ->
         ).decide(request)
 
         assert recorded.provider_response_id == "chatcmpl-authoritative"
+        assert recorded.selections[0].action is Side.REDUCE
         assert attempts[0].provider_response_id == "chatcmpl-authoritative"
         assert decisions == (recorded,)
         assert replayed == recorded
