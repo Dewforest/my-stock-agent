@@ -33,6 +33,7 @@ from stock_agent.strategies.openai_compatible import (
     OpenAICompatibleChatTransport,
     OpenAICompatibleProfile,
     OpenAICompatibleResponseError,
+    OpenAICompatibleResponseErrorCode,
     deepseek_chat_profile,
     openai_chat_profile,
 )
@@ -397,6 +398,23 @@ def test_admitted_provider_fields_remain_exact(mutation: Any) -> None:
     )
     with pytest.raises(OpenAICompatibleResponseError):
         transport.invoke(request)
+
+
+def test_finish_reason_failure_has_safe_diagnostic_code() -> None:
+    request = _request()
+    response = _mutated_provider_response(
+        request,
+        lambda raw: raw["choices"][0].update(finish_reason="length"),
+    )
+    transport = OpenAICompatibleChatTransport(
+        profile=openai_chat_profile(model="gpt", max_tokens=256),
+        http_client=HttpSpy(response),
+    )
+
+    with pytest.raises(OpenAICompatibleResponseError) as captured:
+        transport.invoke(request)
+
+    assert captured.value.code is OpenAICompatibleResponseErrorCode.FINISH_REASON
 
 
 def test_model_content_cannot_claim_provider_response_id() -> None:

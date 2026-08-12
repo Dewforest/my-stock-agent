@@ -115,8 +115,8 @@ class _DiagnosticTransport:
             return response  # type: ignore[no-any-return]
         except LLMHTTPError as error:
             self.failure_category = f"http_{error.code.value}"
-        except OpenAICompatibleResponseError:
-            self.failure_category = "provider_response"
+        except OpenAICompatibleResponseError as error:
+            self.failure_category = f"provider_response_{error.code.value}"
         except TimeoutError:
             self.failure_category = "timeout"
         except Exception:

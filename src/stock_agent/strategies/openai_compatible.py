@@ -4,6 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import StrEnum
 from typing import Protocol
 
 from stock_agent.strategies.llm_contract import LLMDecisionRequest
@@ -32,10 +33,21 @@ _PROVIDER_ENDPOINTS = frozenset(
 )
 
 
+class OpenAICompatibleResponseErrorCode(StrEnum):
+    ENVELOPE = "envelope"
+    FINISH_REASON = "finish_reason"
+    CONTENT_EMPTY = "content_empty"
+    CONTENT_JSON = "content_json"
+
+
 class OpenAICompatibleResponseError(Exception):
     """Stable failure for a malformed OpenAI-compatible provider envelope."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        code: OpenAICompatibleResponseErrorCode = OpenAICompatibleResponseErrorCode.ENVELOPE,
+    ) -> None:
+        self.code = code
         super().__init__("OpenAI-compatible provider response rejected")
 
 
@@ -121,10 +133,12 @@ class OpenAICompatibleChatTransport:
             http_client = host = target = body = None  # type: ignore[assignment]
         result = _parse_provider_response(response)
         response = None  # type: ignore[assignment]
-        payload, response_id, returned_model = result
+        payload, response_id, returned_model, error_code = result
         result = None  # type: ignore[assignment]
         if payload is None or response_id is None or returned_model is None:
-            raise OpenAICompatibleResponseError() from None
+            raise OpenAICompatibleResponseError(
+                error_code or OpenAICompatibleResponseErrorCode.ENVELOPE
+            ) from None
         payload["provider_response_id"] = response_id
         return RawLLMResponse(
             payload=payload,
@@ -153,7 +167,12 @@ def _canonical_json(value: object) -> bytes:
 
 def _parse_provider_response(
     response: object,
-) -> tuple[dict[str, object] | None, str | None, str | None]:
+) -> tuple[
+    dict[str, object] | None,
+    str | None,
+    str | None,
+    OpenAICompatibleResponseErrorCode | None,
+]:
     try:
         raw = _strict_json_bytes(response)
         if type(raw) is not dict:
@@ -171,20 +190,25 @@ def _parse_provider_response(
         ):
             raise ValueError
         choice = choices[0]
-        if type(choice) is not dict or choice.get("finish_reason") != "stop":
+        if type(choice) is not dict:
             raise ValueError
+        if choice.get("finish_reason") != "stop":
+            return None, None, None, OpenAICompatibleResponseErrorCode.FINISH_REASON
         message = choice["message"]
         if type(message) is not dict or message.get("role") != "assistant":
             raise ValueError
         content = message["content"]
         if type(content) is not str or not content.strip():
-            raise ValueError
-        payload = _strict_json_text(content)
+            return None, None, None, OpenAICompatibleResponseErrorCode.CONTENT_EMPTY
+        try:
+            payload = _strict_json_text(content)
+        except (TypeError, UnicodeError, ValueError, json.JSONDecodeError, RecursionError):
+            return None, None, None, OpenAICompatibleResponseErrorCode.CONTENT_JSON
         if type(payload) is not dict or "provider_response_id" in payload:
             raise ValueError
-        return payload, response_id, returned_model
+        return payload, response_id, returned_model, None
     except (KeyError, TypeError, UnicodeError, ValueError, json.JSONDecodeError, RecursionError):
-        return None, None, None
+        return None, None, None, OpenAICompatibleResponseErrorCode.ENVELOPE
 
 
 def _strict_json_bytes(value: object) -> object:
@@ -222,6 +246,7 @@ __all__ = [
     "OpenAICompatibleChatTransport",
     "OpenAICompatibleProfile",
     "OpenAICompatibleResponseError",
+    "OpenAICompatibleResponseErrorCode",
     "deepseek_chat_profile",
     "openai_chat_profile",
 ]

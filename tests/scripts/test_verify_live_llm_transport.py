@@ -8,7 +8,10 @@ from types import ModuleType
 import pytest
 
 from stock_agent.strategies.llm_provider import RawLLMResponse
-from stock_agent.strategies.openai_compatible import OpenAICompatibleResponseError
+from stock_agent.strategies.openai_compatible import (
+    OpenAICompatibleResponseError,
+    OpenAICompatibleResponseErrorCode,
+)
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "verify_live_llm_transport.py"
 
@@ -137,7 +140,9 @@ def test_execute_reports_only_safe_provider_response_category(
 
     class MalformedProviderTransport:
         def invoke(self, request: object) -> object:
-            raise OpenAICompatibleResponseError
+            raise OpenAICompatibleResponseError(
+                OpenAICompatibleResponseErrorCode.FINISH_REASON
+            )
 
     monkeypatch.setattr(module, "build_transport", lambda arguments: MalformedProviderTransport())
 
@@ -145,7 +150,9 @@ def test_execute_reports_only_safe_provider_response_category(
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "live LLM transport verification failed: provider_response\n"
+    assert captured.err == (
+        "live LLM transport verification failed: provider_response_finish_reason\n"
+    )
 
 
 def test_identity_failure_reports_bounded_returned_model_and_accepts_explicit_expectation(
