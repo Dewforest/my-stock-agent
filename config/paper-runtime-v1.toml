@@ -1,0 +1,261 @@
+schema_version = "paper-runtime-config/v1"
+profile_id = "dual-market-paper/v1"
+config_digest = "runtime-config-sha256:a9bcc9ab70e3d818082415f130f2ac5d546153cc992272c677feaf92ec220e14"
+
+[universe]
+universe_id = "dual-market-20/v1"
+digest = "universe-sha256:79619ee5617807e252f9a35ce6c95a4d3a43a97f85f54b300c6493d98b67a177"
+
+[[universe.members]]
+symbol = "600519"
+market = "CN"
+display_name = "贵州茅台"
+currency = "CNY"
+sector = "Consumer Staples"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.1"
+
+[[universe.members]]
+symbol = "601318"
+market = "CN"
+display_name = "中国平安"
+currency = "CNY"
+sector = "Financials"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.1"
+
+[[universe.members]]
+symbol = "600036"
+market = "CN"
+display_name = "招商银行"
+currency = "CNY"
+sector = "Financials"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.1"
+
+[[universe.members]]
+symbol = "600276"
+market = "CN"
+display_name = "恒瑞医药"
+currency = "CNY"
+sector = "Health Care"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.1"
+
+[[universe.members]]
+symbol = "600900"
+market = "CN"
+display_name = "长江电力"
+currency = "CNY"
+sector = "Utilities"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.1"
+
+[[universe.members]]
+symbol = "601088"
+market = "CN"
+display_name = "中国神华"
+currency = "CNY"
+sector = "Energy"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.1"
+
+[[universe.members]]
+symbol = "600030"
+market = "CN"
+display_name = "中信证券"
+currency = "CNY"
+sector = "Financials"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.1"
+
+[[universe.members]]
+symbol = "000333"
+market = "CN"
+display_name = "美的集团"
+currency = "CNY"
+sector = "Consumer Discretionary"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.1"
+
+[[universe.members]]
+symbol = "000858"
+market = "CN"
+display_name = "五粮液"
+currency = "CNY"
+sector = "Consumer Staples"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.1"
+
+[[universe.members]]
+symbol = "300750"
+market = "CN"
+display_name = "宁德时代"
+currency = "CNY"
+sector = "Industrials"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.1"
+
+[[universe.members]]
+symbol = "AAPL"
+market = "US"
+display_name = "Apple"
+currency = "USD"
+sector = "Technology"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.2"
+
+[[universe.members]]
+symbol = "MSFT"
+market = "US"
+display_name = "Microsoft"
+currency = "USD"
+sector = "Technology"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.2"
+
+[[universe.members]]
+symbol = "GOOGL"
+market = "US"
+display_name = "Alphabet"
+currency = "USD"
+sector = "Communication Services"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.2"
+
+[[universe.members]]
+symbol = "AMZN"
+market = "US"
+display_name = "Amazon"
+currency = "USD"
+sector = "Consumer Discretionary"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.2"
+
+[[universe.members]]
+symbol = "META"
+market = "US"
+display_name = "Meta Platforms"
+currency = "USD"
+sector = "Communication Services"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.2"
+
+[[universe.members]]
+symbol = "NVDA"
+market = "US"
+display_name = "NVIDIA"
+currency = "USD"
+sector = "Technology"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.2"
+
+[[universe.members]]
+symbol = "JPM"
+market = "US"
+display_name = "JPMorgan Chase"
+currency = "USD"
+sector = "Financials"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.2"
+
+[[universe.members]]
+symbol = "XOM"
+market = "US"
+display_name = "Exxon Mobil"
+currency = "USD"
+sector = "Energy"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.2"
+
+[[universe.members]]
+symbol = "JNJ"
+market = "US"
+display_name = "Johnson & Johnson"
+currency = "USD"
+sector = "Health Care"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.2"
+
+[[universe.members]]
+symbol = "PG"
+market = "US"
+display_name = "Procter & Gamble"
+currency = "USD"
+sector = "Consumer Staples"
+inclusion_reason = "approved fixed liquid large-cap v1 universe"
+effective_date = 2026-08-12
+source = "approved runtime design section 5.2"
+
+[[accounts]]
+account_id = "paper-cn-v1"
+market = "CN"
+currency = "CNY"
+initial_cash = "1000000"
+
+[[accounts]]
+account_id = "paper-us-v1"
+market = "US"
+currency = "USD"
+initial_cash = "100000"
+
+[[market_data]]
+provider_id = "eastmoney-daily/v1"
+market = "CN"
+
+[[market_data]]
+provider_id = "alpha-vantage-daily/v1"
+market = "US"
+keychain_service = "com.dewforest.my-stock-agent.alpha-vantage"
+keychain_account = "amezf"
+
+[model]
+provider_id = "deepseek-openai-compatible/v1"
+model = "deepseek-v4-pro"
+max_tokens = 1024
+identity_policy_id = "exact-model-v1"
+prompt_template_id = "strategy-a-openai-compatible-json/v1"
+keychain_service = "com.dewforest.my-stock-agent.deepseek"
+keychain_account = "amezf"
+
+[strategy]
+strategy_id = "strategy-a-bounded-llm"
+config_version = "strategy-a-v1"
+short_window = 3
+long_window = 5
+volume_window = 4
+volume_confirmation_threshold = "1.20"
+offensive_target_weight = "0.10"
+neutral_target_weight = "0.05"
+model_identity_policy_id = "exact-model-v1"
+prompt_template_id = "strategy-a-openai-compatible-json/v1"
+prompt_template_digest = "prompt-sha256:64cfe18f171b3ff4acdd325d7bbf1f1a4c78f571ac58a2b8af7a27fd97d49045"
+
+[[schedules]]
+market = "CN"
+version = "cn-sse-szse-2026/research-v1"
+authority_status = "PARTIAL"
+
+[[schedules]]
+market = "US"
+version = "us-nyse-nasdaq-2026/research-v1"
+authority_status = "PARTIAL"
