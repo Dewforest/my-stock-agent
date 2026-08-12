@@ -58,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--provider", choices=("openai", "deepseek"), required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--expected-returned-model")
     parser.add_argument(
         "--env-var",
         required=True,
@@ -105,10 +106,13 @@ class _DiagnosticTransport:
     def __init__(self, transport: object) -> None:
         self._transport = transport
         self.failure_category: str | None = None
+        self.returned_model: str | None = None
 
     def invoke(self, request: LLMDecisionRequest) -> RawLLMResponse:
         try:
-            return self._transport.invoke(request)  # type: ignore[attr-defined,no-any-return]
+            response = self._transport.invoke(request)  # type: ignore[attr-defined]
+            self.returned_model = _safe_model_identifier(response.model_identity)
+            return response  # type: ignore[no-any-return]
         except LLMHTTPError as error:
             self.failure_category = f"http_{error.code.value}"
         except OpenAICompatibleResponseError:
@@ -118,6 +122,17 @@ class _DiagnosticTransport:
         except Exception:
             self.failure_category = "transport"
         raise _DiagnosticFailure from None
+
+
+def _safe_model_identifier(value: object) -> str | None:
+    if (
+        type(value) is str
+        and 1 <= len(value) <= 256
+        and value.isascii()
+        and not any(character.isspace() or ord(character) < 33 for character in value)
+    ):
+        return value
+    return None
 
 
 def _request(model: str) -> LLMDecisionRequest:
@@ -203,10 +218,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     request = _request(arguments.model)
     diagnostic_transport = _DiagnosticTransport(transport)
+    expected_model = arguments.expected_returned_model or arguments.model
+    if _safe_model_identifier(expected_model) is None:
+        print(_FAILURE, file=sys.stderr)
+        return 2
     policy = ExactModelIdentityPolicy(
         policy_id=request.model_identity_policy_id,
-        model_identity=arguments.model,
-        model_revision=f"api-model-id:{arguments.model}",
+        model_identity=expected_model,
+        model_revision=f"api-model-id:{expected_model}",
     )
     try:
         with LLMDecisionJournal() as journal:
@@ -226,8 +245,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             )
     except LLMProviderError as error:
-        category = diagnostic_transport.failure_category or error.code.value
-        print(f"{_FAILURE}: {category}", file=sys.stderr)
+        category = diagnostic_transport.failure_category or error.code.value.lower()
+        detail = ""
+        if category == "identity_policy" and diagnostic_transport.returned_model is not None:
+            detail = " returned_model=" + json.dumps(diagnostic_transport.returned_model)
+        print(f"{_FAILURE}: {category}{detail}", file=sys.stderr)
         return 1
     except Exception:
         print(f"{_FAILURE}: internal", file=sys.stderr)

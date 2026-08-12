@@ -7,6 +7,7 @@ from types import ModuleType
 
 import pytest
 
+from stock_agent.strategies.llm_provider import RawLLMResponse
 from stock_agent.strategies.openai_compatible import OpenAICompatibleResponseError
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "verify_live_llm_transport.py"
@@ -145,3 +146,32 @@ def test_execute_reports_only_safe_provider_response_category(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "live LLM transport verification failed: provider_response\n"
+
+
+def test_identity_failure_reports_bounded_returned_model_and_accepts_explicit_expectation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+
+    class ReturnedModelTransport:
+        def invoke(self, request: object) -> RawLLMResponse:
+            return RawLLMResponse(
+                payload={},
+                model_identity="deepseek-v3.1-terminus",
+                model_revision="api-model-id:deepseek-v3.1-terminus",
+            )
+
+    monkeypatch.setattr(module, "build_transport", lambda arguments: ReturnedModelTransport())
+
+    assert module.main(_args("--execute")) == 1
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "live LLM transport verification failed: identity_policy "
+        'returned_model="deepseek-v3.1-terminus"\n'
+    )
+
+    parsed = module.build_parser().parse_args(
+        [*_args(), "--expected-returned-model", "deepseek-v3.1-terminus"]
+    )
+    assert parsed.expected_returned_model == "deepseek-v3.1-terminus"
