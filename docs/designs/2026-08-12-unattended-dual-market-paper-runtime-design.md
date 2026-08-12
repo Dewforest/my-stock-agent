@@ -71,9 +71,25 @@ Production implementation starts with four bounded evidence tasks whose results 
 3. corporate-action authority for splits, dividends, symbol changes, mergers, and delistings;
 4. noninteractive access to the two approved Keychain items from the installed GUI-domain LaunchAgent.
 
-Each proof ends in `VALIDATED`, `PARTIAL`, or `INVALIDATED`, records the exact source/profile/schema/budget/timestamp contract, and contains an offline recorded fixture with whole-response provenance. `PARTIAL` or `INVALIDATED` blocks only the dependent production authority; it cannot be bypassed with inferred weekdays, close-published daily opens, OHLCV-derived session state, guessed corporate actions, or interactive Keychain prompts.
+Each completed proof ends in `VALIDATED`, `PARTIAL`, or `INVALIDATED`. A production-authorizing `VALIDATED` proof must record the exact source/profile/schema/budget/timestamp/license contract and offline source artifacts with whole-response provenance. A research report or report digest without those source artifacts freezes the investigation result but does not close the authority gate. `PARTIAL` or `INVALIDATED` blocks only the dependent production authority; it cannot be bypassed with inferred weekdays, close-published daily opens, OHLCV-derived session state, guessed corporate actions, or interactive Keychain prompts.
 
 The runtime may be developed offline through audited decision and pending-order persistence while an execution gate remains blocked. Automatic fills and LaunchAgent activation are not accepted until their corresponding Phase 0 proof is `VALIDATED` and this document is amended with the selected source contract.
+
+Phase 0 evidence recorded on 2026-08-12:
+
+- annual calendars: `PARTIAL`; official pages were manually cross-checked for 2026 schedule facts, including NYSE/Nasdaq half days and DST, but complete source-artifact closure, derived-data install/redistribution policy, and adjacent CN/US approved versions are unavailable;
+- execution open/session state: `PARTIAL`, with CN price-limit inference explicitly `INVALIDATED`; neither market may auto-fill from the tested public web endpoints;
+- corporate actions: official legal-disclosure source classes were identified, but there is no source-artifact manifest or complete standardized market-treatment feed; the result remains `PARTIAL` and position-bearing activation stays blocked;
+- LaunchAgent Keychain ACL: not yet executed and remains an activation gate.
+
+Versioned investigation evidence:
+
+- `docs/verification/2026-08-12-cn-us-annual-calendar-authority.md`;
+- `docs/verification/2026-08-12-cn-us-open-execution-and-cn-session-state-authority.md`;
+- `docs/verification/2026-08-12-cn-us-corporate-action-authority.md`;
+- raw execution candidate fixtures and manifest under `docs/verification/execution-authority-2026-08-12/`.
+
+Only the execution-candidate probe currently has whole-response fixtures. The calendar and corporate-action reports are research summaries whose report hashes prevent silent mutation but do not prove source content. These verdicts allow implementation of durable runtime state, audit/decision paths, and capability gates. They do not authorize a production calendar marked `OFFICIAL`, automatic fills, automatic position holding, or LaunchAgent activation.
 
 ## 4. Architecture
 
@@ -209,8 +225,10 @@ Therefore:
 - pending orders may be persisted before this capability exists;
 - no fill is booked without an admitted execution-open observation;
 - CN fills also require admitted suspension/price-limit state;
-- missing execution authority produces an explicit terminal/retryable execution status, never a fabricated fill;
+- missing execution authority leaves the order `PENDING` and creates a retryable `EXECUTION_BLOCKED_DATA` obligation, never a fabricated fill;
 - OHLCV values must not be used to guess suspension or limit state.
+
+The 2026-08-12 public-endpoint probe did not validate an execution authority. Eastmoney `push2delay` and Nasdaq.com chart JSON are research candidates only: their field semantics, first-availability time, corrections, SLA, limits, and machine-use permission are insufficient. Nasdaq Opening Cross establishes official business semantics but the licensed feed/vendor path for the full US universe is not connected. CN exchange/vendor state for suspension and price limits is also not connected. Consequently automatic fills remain blocked as `EXECUTION_BLOCKED_DATA` until a later normative amendment names a validated product/profile.
 
 This is an implementation acceptance gate, not optional hardening.
 
@@ -297,14 +315,39 @@ DISCOVERED
                            -> SUCCEEDED
 ```
 
-Execution of prior orders has its own durable state per order:
+Pending orders and execution obligations have separate durable lifecycles.
 
 ```text
-PENDING -> EXECUTION_READY -> PREPARED -> FINALIZED_FILLED | FINALIZED_REJECTED
-                            -> EXECUTION_DATA_MISSING
+PendingOrder:
+  PENDING -> FINALIZED_FILLED | FINALIZED_REJECTED | FINALIZED_EXPIRED | FINALIZED_CANCELLED
+
+ExecutionObligation:
+  DISCOVERED -> READY -> PREPARED -> FINALIZED_FILLED
+                                 -> FINALIZED_REJECTED
+                    -> BLOCKED_DATA -> READY
+
+  any nonterminal state -> TERMINATED_EXPIRED
+                        -> TERMINATED_CANCELLED
 ```
 
 Every local process creates an immutable run attempt record. The run's business identity remains stable across attempts.
+
+`ExecutionObligation.BLOCKED_DATA` is not terminal and does not consume or replace `PendingOrder.PENDING`. It records the order ID, intended effective time, missing authority profile/version, first/last attempt time, retry eligibility, and error digest. An approved authority amendment may move the obligation back to `READY` only while the linked order remains `PENDING`, is unexpired, and chronology still permits it.
+
+Retry updates only the obligation in one runtime SQLite transaction and leaves the order pending. Expiry or operator cancellation is legal from `DISCOVERED`, `READY`, `PREPARED`, or `BLOCKED_DATA`, subject to optimistic version and lease ownership checks. Expiry atomically moves the obligation to `TERMINATED_EXPIRED` and the linked order to `FINALIZED_EXPIRED`; operator cancellation atomically moves them to `TERMINATED_CANCELLED` and `FINALIZED_CANCELLED`. A fill/rejection atomically finalizes the obligation, finalizes the order, persists the typed execution result, and commits the matching ledger batch. Any identity/digest mismatch rolls back and halts the account.
+
+Legal terminal pairs are exhaustive:
+
+| Execution obligation | Pending order | Required execution result |
+|---|---|---|
+| `FINALIZED_FILLED` | `FINALIZED_FILLED` | typed fill payload and non-empty deterministic ledger batch |
+| `FINALIZED_REJECTED` | `FINALIZED_REJECTED` | typed rejection reason and the policy-defined zero/non-fill ledger batch |
+| `TERMINATED_EXPIRED` | `FINALIZED_EXPIRED` | expiry policy/version and occurrence time; no fill events |
+| `TERMINATED_CANCELLED` | `FINALIZED_CANCELLED` | operator identity, reason, and occurrence time; no fill events |
+
+No other terminal pairing is valid. The transaction checks the execution-result discriminator against both terminal states; a mismatch rolls back. `PREPARED` cannot be expired or cancelled while a live execution lease may still send or commit: the transition first proves the lease absent/expired and that no send intent or terminal result exists. An ambiguous external send remains a reconciliation state and is not converted to expiry or cancellation.
+
+The chronology watermark is derived from the earliest unresolved obligation effective time. It advances only after the obligation and linked order reach a mutually valid terminal pair in the same transaction. A blocked obligation prevents later effective-time ledger events for that account, but does not block the other market/account. It may not be deleted or skipped merely to advance NAV.
 
 A failure is never represented as HOLD. It creates no fabricated intent or order and does not mutate the portfolio except for separately committed prior-order execution work.
 
@@ -402,6 +445,8 @@ Raw unadjusted daily OHLCV is insufficient for a long-running account. Phase 0 m
 
 Until that authority is validated, any position-bearing activation is blocked. A price-jump heuristic is not an authority and cannot silently repair quantity, cost basis, cash, NAV, or P&L.
 
+The 2026-08-12 proof validated SEC and CN statutory/exchange disclosures as legal-fact authorities, but not a complete standardized market-treatment feed. Alpha Vantage and Eastmoney remain discovery/history cross-check sources. Nasdaq/NYSE/FINRA and authorized CN exchange/vendor products require entitlement and licensing validation. This keeps the corporate-action gate `PARTIAL` and position-bearing activation blocked.
+
 ## 16. Risk and decision atomicity
 
 Each market sends one complete, canonical 10-candidate request to the bounded LLM. Missing, duplicate, reordered, malformed, or out-of-envelope selections reject the entire market decision. No successful prefix is admitted.
@@ -466,7 +511,7 @@ Installation validates the plist, bootstraps it into the user GUI domain, perfor
 
 Kill switches have explicit `GLOBAL`, `MARKET`, and `ACCOUNT` scopes in runtime SQLite. The most specific affected scope is used by default; only an operator may set or clear `GLOBAL`. A switch blocks new fetch/decision/order work for its scope but permits status, reports, reconciliation, and integrity repair. One account's corruption cannot silently escalate to the other market.
 
-All budgets, leases, retries, grace periods, and deadlines are stored and compared as aware UTC instants. Alpha Vantage daily quota uses `America/New_York` natural-day boundaries `[00:00, next 00:00)`, then stores the derived UTC interval. Cross-year next-session resolution requires both adjacent approved schedule versions; absence or digest conflict yields calendar-not-covered and no order.
+All budgets, leases, retries, grace periods, and deadlines are stored and compared as aware UTC instants. Alpha Vantage daily quota uses `America/New_York` natural-day boundaries `[00:00, next 00:00)`, then stores the derived UTC interval. Cross-year next-session resolution requires adjacent approved schedule versions for every exchange represented by the market profile. For the combined US profile, both NYSE and Nasdaq adjacent versions are mandatory; an NYSE multi-year page alone cannot authorize the transition. Absence or digest conflict yields calendar-not-covered and no order.
 
 ## 20. Acceptance tests
 
@@ -510,13 +555,13 @@ Version 1 does not include:
 
 ## 22. Delivery sequence
 
-1. versioned universe, deployment profile, and annual schedules;
+1. versioned universe and deployment profile; implement schedule models and local-generation tooling, but do not check in or label derived 2026 schedules `OFFICIAL` until source-artifact and license/install gates close;
 2. runtime state models/store and deterministic claim/recovery;
 3. durable ledger event and order/execution stores;
 4. per-symbol fetch orchestration, budgets, and coverage gate;
 5. frozen snapshot and bounded decision recovery;
 6. batch risk and atomic pending-order persistence;
-7. admitted open/session-state execution and ledger booking;
+7. admitted open/session-state execution and ledger booking only after the execution authority verdict becomes `VALIDATED`;
 8. reports and operational CLI;
 9. Keychain sources and zero-access negative tests;
 10. LaunchAgent generation/installer;

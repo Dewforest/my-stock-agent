@@ -74,29 +74,33 @@ uv run pytest tests/runtime/test_universe_and_config.py -q
 
 ### Task 2: Prove and then freeze authoritative annual market schedules
 
-**Objective:** First prove an authoritative/licensed CN/US calendar source; only a `VALIDATED` proof may produce immutable aware schedules with DST, half-day, cross-year, and provenance semantics.
+**Objective:** Build strict schedule models and a local private-generation workflow from a research report; do not commit derived exchange data or claim `OFFICIAL` authority until source-artifact and license/install gates close.
 
 **Files:**
-- Create: `spikes/001-authoritative-calendar/README.md`
-- Create: `spikes/001-authoritative-calendar/probe.py`
-- Create after `VALIDATED`: `src/stock_agent/runtime/calendars.py`
-- Create after `VALIDATED`: `config/calendars/cn-sse-szse-2026.json`
-- Create after `VALIDATED`: `config/calendars/us-nyse-nasdaq-2026.json`
+- Read: `docs/verification/2026-08-12-cn-us-annual-calendar-authority.md`
+- Create: `src/stock_agent/runtime/calendars.py`
+- Create: `scripts/generate_private_runtime_calendar.py`
+- Create: `config/calendars/README.md` describing the ignored user-only output location and license gate
 - Test: `tests/runtime/test_calendars.py`
 
 **RED tests:**
 
-- schedules contain exact plain session dates and aware open/close instants;
+- strict models validate synthetic test schedules containing aware open/close instants;
 - US DST UTC offsets change correctly and at least one approved half-day closes early;
 - CN/US closure dates are explicit rather than weekday-derived;
 - schedule rows sort strictly with no duplicates/overlaps;
 - runtime schedule can create 10 per-symbol requests without duplicating calendar data;
 - schedule digest/provenance mismatch fails closed;
 - date outside published schedule produces a stable calendar-not-covered result and zero provider/Keychain calls.
+- CN and US cross-year `next_session` remain `CALENDAR_NOT_COVERED` until every represented exchange has an adjacent approved official version;
+- community calendar libraries may detect discrepancies but cannot populate `authority=OFFICIAL`.
+- `PARTIAL` research reports and locally derived schedules cannot populate `authority=OFFICIAL`;
+- generated exchange data is written only to the configured user-only ignored runtime directory, never the repository;
+- missing or non-approved license/install profile fails before schedule activation.
 
 **Minimal implementation:**
 
-Run the bounded proof with user-authorized network access and record `VALIDATED`, `PARTIAL`, or `INVALIDATED`, source/licensing/install policy, and exact evidence. Stop dependent work on non-validated authority. After validation, create a strict schedule loader and a `RuntimeMarketSchedule` projection over existing schedule semantics. Keep annual files immutable and source-attributed; require adjacent approved versions for cross-year next-session resolution.
+Create strict schedule/provenance/license models and a `RuntimeMarketSchedule` projection over existing schedule semantics. The generator may assist a user-authorized private installation, but its output remains `RESEARCH_DERIVED/PARTIAL` until exact source artifacts, parser evidence, and install/license profiles are approved. Require adjacent approved versions for every exchange in cross-year resolution. Do not copy third-party output or research summaries into an official authority field.
 
 **Focused verification:**
 
@@ -329,37 +333,37 @@ uv run pytest tests/runtime/test_durable_ledger.py -q
 
 ### Task 9: Prove and admit execution and corporate-action authorities
 
-**Objective:** Prove real source contracts for execution-visible open observations, CN suspension/price-limit state, and corporate actions before enabling fills or position-bearing activation.
+**Objective:** Enforce the recorded `PARTIAL/INVALIDATED` verdicts as durable capability gates; do not implement fills or position-bearing activation until a later approved authority amendment exists.
 
 **Files:**
-- Create: `spikes/002-cn-open-session-authority/README.md`
-- Create: `spikes/002-cn-open-session-authority/probe.py`
-- Create: `spikes/003-us-open-authority/README.md`
-- Create: `spikes/003-us-open-authority/probe.py`
-- Create: `spikes/004-corporate-actions/README.md`
-- Create: `spikes/004-corporate-actions/probe.py`
-- Create after `VALIDATED`: `src/stock_agent/runtime/execution_data.py`
-- Create after `VALIDATED`: `src/stock_agent/runtime/corporate_actions.py`
-- Create: `tests/fixtures/runtime/execution-data/`
-- Create: `tests/fixtures/runtime/corporate-actions/`
+- Read: `docs/verification/2026-08-12-cn-us-open-execution-and-cn-session-state-authority.md`
+- Read: `docs/verification/2026-08-12-cn-us-corporate-action-authority.md`
+- Read: `docs/verification/execution-authority-2026-08-12/manifest.json`
+- Create: `src/stock_agent/runtime/capability_gates.py`
 - Test: `tests/runtime/test_execution_data_authority.py`
 - Test: `tests/runtime/test_corporate_action_authority.py`
 
 **RED tests:**
 
-- a close-published daily row cannot construct an execution-open observation;
-- observation requires source ID, provider record ID, observed/available/ingested timestamps, intended market/session/symbol, and canonical digest;
-- CN execution state explicitly represents suspension and price-limit blocking;
-- missing/stale/mismatched data produces `EXECUTION_DATA_MISSING`, never a fill;
-- corrections append as revisions and frozen execution selection is deterministic;
-- recorded real provider fixtures preserve exact normalized source rows and whole-response provenance;
-- corporate-action schema distinguishes ex/effective/available/ingested instants and append-only revisions;
-- split/bonus, cash dividend, symbol change, merger, and delisting events transform ledger state before same-effective-time valuation/execution;
-- missing corporate-action authority blocks position-bearing activation; price-jump heuristics cannot authorize repair.
+- recorded report digests and execution fixture manifest hashes load exactly and survive restart, while tests preserve the distinction between report integrity and source-evidence closure;
+- a close-published daily row and the recorded public web candidates cannot construct an admitted execution-open observation;
+- CN price equality, Eastmoney `f51/f52`, missing row, zero volume, or daily OHLCV cannot produce suspension/limit authority;
+- pending orders remain `PENDING` and gain a separate retryable `ExecutionObligation.BLOCKED_DATA`, never a fill, while the gate is not validated;
+- an approved authority amendment retries only the same unexpired obligation while the linked order remains pending;
+- expiry atomically pairs `ExecutionObligation.TERMINATED_EXPIRED` with `PendingOrder.FINALIZED_EXPIRED`;
+- operator cancellation atomically pairs `ExecutionObligation.TERMINATED_CANCELLED` with `PendingOrder.FINALIZED_CANCELLED`;
+- expiry/cancellation are legal from every nonterminal obligation state only after lease/send-intent safety checks;
+- fill atomically pairs `ExecutionObligation.FINALIZED_FILLED` with `PendingOrder.FINALIZED_FILLED`, a typed fill payload, and a non-empty deterministic ledger batch;
+- rejection atomically pairs `ExecutionObligation.FINALIZED_REJECTED` with `PendingOrder.FINALIZED_REJECTED`, a typed reason, and the policy-defined non-fill ledger batch;
+- all other terminal pairings and result discriminators fail the transaction;
+- the account chronology watermark advances only after a valid terminal pair; an unresolved earlier obligation blocks only that account's later effective-time ledger progression;
+- legal-disclosure authority without complete market-treatment authority blocks position-bearing activation;
+- Alpha Vantage/Eastmoney records cannot be promoted to corporate-action authority by configuration;
+- a later authority amendment requires a new version/digest and cannot mutate the 2026-08-12 verdict in place.
 
 **Implementation gate:**
 
-Research provider documentation and execute separately authorized, bounded live proofs only after the user is told about network/credential implications and request budgets. Each proof records `VALIDATED`, `PARTIAL`, or `INVALIDATED` and the exact schema/source/timestamp/revision/expiry contract. If no trustworthy bounded source is available, stop dependent production work: keep fills disabled and block position-bearing activation. Do not synthesize session or corporate-action state from OHLCV.
+Implement only the fail-closed capability gate from the recorded evidence. The selected public candidates are not production authorities. Any future vendor/feed proof is a separate explicitly disclosed task that must amend the design, evidence, provider profile, license/entitlement, fixture manifest, and tests before `execution_data.py`, corporate-action transforms, or automatic fills are created.
 
 **Focused verification:**
 
@@ -367,13 +371,15 @@ Research provider documentation and execute separately authorized, bounded live 
 uv run pytest tests/runtime/test_execution_data_authority.py tests/runtime/test_corporate_action_authority.py -q
 ```
 
-**Commit:** `feat: admit forward execution data authority`
+**Commit:** `feat: enforce unresolved execution authority gates`
 
 ---
 
 ### Task 10: Execute pending orders and book ledger events idempotently
 
 **Objective:** Process due orders at their intended open, persist terminal execution, and book one replayable ledger valuation boundary without duplicate fills.
+
+**Hard precondition:** Do not start this task while Task 9's execution or corporate-action gate remains non-`VALIDATED`. Under the 2026-08-12 verdict this task is blocked; the runtime preserves audited pending orders plus retryable `EXECUTION_BLOCKED_DATA` obligations.
 
 **Files:**
 - Create: `src/stock_agent/runtime/execution.py`
