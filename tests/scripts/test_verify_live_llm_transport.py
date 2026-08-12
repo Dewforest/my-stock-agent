@@ -7,6 +7,8 @@ from types import ModuleType
 
 import pytest
 
+from stock_agent.strategies.openai_compatible import OpenAICompatibleResponseError
+
 SCRIPT = Path(__file__).parents[2] / "scripts" / "verify_live_llm_transport.py"
 
 
@@ -122,5 +124,24 @@ def test_execute_with_missing_credential_fails_before_network_with_fixed_output(
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "live LLM transport verification failed\n"
+    assert captured.err == "live LLM transport verification failed: http_credential\n"
     assert "OPENAI_TEST_KEY" not in captured.err
+
+
+def test_execute_reports_only_safe_provider_response_category(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+
+    class MalformedProviderTransport:
+        def invoke(self, request: object) -> object:
+            raise OpenAICompatibleResponseError
+
+    monkeypatch.setattr(module, "build_transport", lambda arguments: MalformedProviderTransport())
+
+    assert module.main(_args("--execute")) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "live LLM transport verification failed: provider_response\n"

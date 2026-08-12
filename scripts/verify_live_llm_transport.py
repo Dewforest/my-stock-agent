@@ -23,17 +23,21 @@ from stock_agent.strategies.llm_contract import (
 from stock_agent.strategies.llm_http import (
     BoundedBearerHttpsClient,
     EnvironmentBearerTokenSource,
+    LLMHTTPError,
 )
 from stock_agent.strategies.llm_journal import LLMDecisionJournal
 from stock_agent.strategies.llm_provider import (
     ExactModelIdentityPolicy,
     InvocationStart,
+    LLMProviderError,
+    RawLLMResponse,
     RecordedLLMDecisionProvider,
 )
 from stock_agent.strategies.openai_compatible import (
     PROMPT_TEMPLATE_DIGEST,
     PROMPT_TEMPLATE_ID,
     OpenAICompatibleChatTransport,
+    OpenAICompatibleResponseError,
     deepseek_chat_profile,
     openai_chat_profile,
 )
@@ -91,6 +95,29 @@ class _LiveInvocationBoundary:
     def end_at(self, invocation: InvocationStart) -> datetime:
         ended = datetime.now(UTC)
         return max(ended, invocation.started_at)
+
+
+class _DiagnosticFailure(Exception):
+    pass
+
+
+class _DiagnosticTransport:
+    def __init__(self, transport: object) -> None:
+        self._transport = transport
+        self.failure_category: str | None = None
+
+    def invoke(self, request: LLMDecisionRequest) -> RawLLMResponse:
+        try:
+            return self._transport.invoke(request)  # type: ignore[attr-defined,no-any-return]
+        except LLMHTTPError as error:
+            self.failure_category = f"http_{error.code.value}"
+        except OpenAICompatibleResponseError:
+            self.failure_category = "provider_response"
+        except TimeoutError:
+            self.failure_category = "timeout"
+        except Exception:
+            self.failure_category = "transport"
+        raise _DiagnosticFailure from None
 
 
 def _request(model: str) -> LLMDecisionRequest:
@@ -175,6 +202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     request = _request(arguments.model)
+    diagnostic_transport = _DiagnosticTransport(transport)
     policy = ExactModelIdentityPolicy(
         policy_id=request.model_identity_policy_id,
         model_identity=arguments.model,
@@ -183,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with LLMDecisionJournal() as journal:
             decision = RecordedLLMDecisionProvider(
-                transport=transport,
+                transport=diagnostic_transport,
                 journal=journal,
                 model_policy=policy,
                 invocation_boundary=_LiveInvocationBoundary(),
@@ -197,8 +225,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "status": "success",
                 }
             )
+    except LLMProviderError as error:
+        category = diagnostic_transport.failure_category or error.code.value
+        print(f"{_FAILURE}: {category}", file=sys.stderr)
+        return 1
     except Exception:
-        print(_FAILURE, file=sys.stderr)
+        print(f"{_FAILURE}: internal", file=sys.stderr)
         return 1
     return 0
 
