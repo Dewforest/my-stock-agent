@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from typing import Annotated
 
 import typer
 
@@ -29,7 +30,9 @@ def build_app(handlers: dict[str, CommandHandler] | None = None) -> typer.Typer:
         raise typer.Exit(code)
 
     @app.command()
-    def run_once() -> None:
+    def run_once(
+        config: Annotated[str | None, typer.Option("--config")] = None,
+    ) -> None:
         _invoke("run_once")
 
     @app.command()
