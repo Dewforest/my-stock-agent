@@ -25,6 +25,15 @@ from stock_agent.runtime.capability_gates import (
     CorporateActionAuthorityBlockedError,
     ExecutionAuthorityBlockedError,
 )
+from stock_agent.runtime.cli import (
+    EXIT_INTERNAL_CORRUPTION,
+    EXIT_KILL_SWITCH,
+    EXIT_NO_WORK,
+    EXIT_RECONCILIATION,
+    EXIT_RETRYABLE_FAILURE,
+    build_app,
+    emit_envelope,
+)
 from stock_agent.runtime.clock import MarketClock
 from stock_agent.runtime.decision import (
     DecisionCoordinator,
@@ -50,6 +59,7 @@ from stock_agent.runtime.keychain import (
     Secret,
 )
 from stock_agent.runtime.ledger_store import LedgerStore, LedgerStoreError
+from stock_agent.runtime.lock import LockHeldError, ProcessLock
 from stock_agent.runtime.market_data import (
     BatchReport,
     MarketDataBatchOrchestrator,
@@ -146,6 +156,11 @@ __all__ = [
     "APPROVED_KEYCHAIN_SERVICES",
     "CORPORATE_ACTIONS",
     "EXECUTION_OPEN_AND_CN_SESSION_STATE",
+    "EXIT_INTERNAL_CORRUPTION",
+    "EXIT_KILL_SWITCH",
+    "EXIT_NO_WORK",
+    "EXIT_RECONCILIATION",
+    "EXIT_RETRYABLE_FAILURE",
     "EXPECTED_RUNTIME_CONFIG_V1_DIGEST",
     "EXPECTED_UNIVERSE_V1_DIGEST",
     "LAUNCHAGENT_KEYCHAIN_ACL",
@@ -185,6 +200,7 @@ __all__ = [
     "LeaseHeldError",
     "LedgerStore",
     "LedgerStoreError",
+    "LockHeldError",
     "MarketAccountProfile",
     "MarketClock",
     "MarketDataBatchOrchestrator",
@@ -198,6 +214,7 @@ __all__ = [
     "PaperRuntimeConfig",
     "PendingOrder",
     "PrivateInstallProfile",
+    "ProcessLock",
     "ProviderBudgetProfile",
     "ReportStatus",
     "RiskResultEnvelope",
@@ -228,6 +245,7 @@ __all__ = [
     "UniverseMember",
     "UniverseSnapshot",
     "attempt_id_for",
+    "build_app",
     "build_pending_orders",
     "build_risk_envelopes",
     "canonical_manifest_digest",
@@ -236,6 +254,7 @@ __all__ = [
     "canonical_universe_digest",
     "classify_failure",
     "currency_for",
+    "emit_envelope",
     "evaluate_and_persist",
     "freeze_snapshot",
     "is_legal_transition",
