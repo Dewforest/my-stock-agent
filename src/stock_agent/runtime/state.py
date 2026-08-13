@@ -157,6 +157,44 @@ class KillSwitch(RuntimeModel):
 
 class OrderStatus(StrEnum):
     PENDING = "PENDING"
+    FINALIZED_FILLED = "FINALIZED_FILLED"
+    FINALIZED_REJECTED = "FINALIZED_REJECTED"
+    FINALIZED_EXPIRED = "FINALIZED_EXPIRED"
+    FINALIZED_CANCELLED = "FINALIZED_CANCELLED"
+
+
+class ExecutionObligationStatus(StrEnum):
+    DISCOVERED = "DISCOVERED"
+    READY = "READY"
+    PREPARED = "PREPARED"
+    BLOCKED_DATA = "BLOCKED_DATA"
+    FINALIZED_FILLED = "FINALIZED_FILLED"
+    FINALIZED_REJECTED = "FINALIZED_REJECTED"
+    TERMINATED_EXPIRED = "TERMINATED_EXPIRED"
+    TERMINATED_CANCELLED = "TERMINATED_CANCELLED"
+
+
+_OBLIGATION_TERMINAL = frozenset(
+    {
+        ExecutionObligationStatus.FINALIZED_FILLED,
+        ExecutionObligationStatus.FINALIZED_REJECTED,
+        ExecutionObligationStatus.TERMINATED_EXPIRED,
+        ExecutionObligationStatus.TERMINATED_CANCELLED,
+    }
+)
+
+
+def obligation_is_terminal(status: ExecutionObligationStatus) -> bool:
+    return status in _OBLIGATION_TERMINAL
+
+
+class ExecutionObligation(RuntimeModel):
+    obligation_id: str
+    order_id: str
+    status: ExecutionObligationStatus
+    intended_session_date: date
+    missing_authority: NonEmptyStr | None = None
+    error_digest: str | None = None
 
 
 class PendingOrder(RuntimeModel):

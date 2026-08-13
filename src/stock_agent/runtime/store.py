@@ -289,6 +289,18 @@ class RuntimeStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS execution_obligations (
+                obligation_id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                intended_session_date TEXT NOT NULL,
+                missing_authority TEXT,
+                error_digest TEXT
+            )
+            """
+        )
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -1059,6 +1071,183 @@ class RuntimeStore:
             ordinal=int(str(row[7])),
             status=OrderStatus(str(row[8])),
         )
+
+    # ── execution obligations ───────────────────────────────────────────────
+
+    def create_execution_obligation(
+        self, *, order_id: str, obligation_id: str, intended_session_date: date, now: datetime
+    ) -> None:
+        self._ensure_open()
+        if (
+            type(order_id) is not str
+            or not order_id
+            or type(obligation_id) is not str
+            or not obligation_id
+            or type(intended_session_date) is not date
+            or type(now) is not datetime
+            or now.tzinfo is None
+        ):
+            raise StoreError("create_execution_obligation received invalid arguments")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT status FROM pending_orders WHERE order_id = ?", [order_id]
+            ).fetchone()
+            if row is None or str(row[0]) != "PENDING":
+                raise StoreError("obligation requires a pending order")
+            self._connection.execute(
+                "INSERT INTO execution_obligations "
+                "(obligation_id, order_id, status, intended_session_date) "
+                "VALUES (?, ?, ?, ?)",
+                [obligation_id, order_id, "DISCOVERED", intended_session_date.isoformat()],
+            )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def block_obligation_data(
+        self, *, order_id: str, missing_authority: str, error_digest: str | None, now: datetime
+    ) -> None:
+        self._ensure_open()
+        if (
+            type(order_id) is not str
+            or not order_id
+            or type(missing_authority) is not str
+            or not missing_authority
+        ):
+            raise StoreError("block_obligation_data received invalid arguments")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT status FROM execution_obligations WHERE order_id = ?", [order_id]
+            ).fetchone()
+            if row is None:
+                raise StoreError("block targets an unknown obligation")
+            if str(row[0]) in (
+                "FINALIZED_FILLED",
+                "FINALIZED_REJECTED",
+                "TERMINATED_EXPIRED",
+                "TERMINATED_CANCELLED",
+            ):
+                raise StoreError("terminal obligation cannot be blocked")
+            self._connection.execute(
+                "UPDATE execution_obligations SET status = 'BLOCKED_DATA', "
+                "missing_authority = ?, error_digest = ? WHERE order_id = ?",
+                [missing_authority, error_digest, order_id],
+            )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def mark_obligation_ready(self, *, order_id: str, now: datetime) -> None:
+        self._ensure_open()
+        if type(order_id) is not str or not order_id:
+            raise StoreError("mark_obligation_ready received an invalid order id")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT status FROM execution_obligations WHERE order_id = ?", [order_id]
+            ).fetchone()
+            if row is None or str(row[0]) != "BLOCKED_DATA":
+                raise StoreError("only a blocked obligation can become ready")
+            self._connection.execute(
+                "UPDATE execution_obligations SET status = 'READY', "
+                "missing_authority = NULL, error_digest = NULL WHERE order_id = ?",
+                [order_id],
+            )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def _finalize_order(
+        self, *, order_id: str, obligation_terminal: str, order_final: str, now: datetime
+    ) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            obligation = self._connection.execute(
+                "SELECT status FROM execution_obligations WHERE order_id = ?", [order_id]
+            ).fetchone()
+            order = self._connection.execute(
+                "SELECT status FROM pending_orders WHERE order_id = ?", [order_id]
+            ).fetchone()
+            if obligation is None or order is None:
+                raise StoreError("finalize targets an unknown order/obligation")
+            if str(order[0]) != "PENDING":
+                raise StoreError("only a pending order can be finalized")
+            if str(obligation[0]) in (
+                "FINALIZED_FILLED",
+                "FINALIZED_REJECTED",
+                "TERMINATED_EXPIRED",
+                "TERMINATED_CANCELLED",
+            ):
+                raise StoreError("terminal obligation cannot be finalized again")
+            self._connection.execute(
+                "UPDATE execution_obligations SET status = ? WHERE order_id = ?",
+                [obligation_terminal, order_id],
+            )
+            self._connection.execute(
+                "UPDATE pending_orders SET status = ? WHERE order_id = ?",
+                [order_final, order_id],
+            )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def finalize_fill(self, *, order_id: str, now: datetime) -> None:
+        self._ensure_open()
+        self._finalize_order(
+            order_id=order_id,
+            obligation_terminal="FINALIZED_FILLED",
+            order_final="FINALIZED_FILLED",
+            now=now,
+        )
+
+    def finalize_rejection(self, *, order_id: str, now: datetime) -> None:
+        self._ensure_open()
+        self._finalize_order(
+            order_id=order_id,
+            obligation_terminal="FINALIZED_REJECTED",
+            order_final="FINALIZED_REJECTED",
+            now=now,
+        )
+
+    def terminate_expired(self, *, order_id: str, now: datetime) -> None:
+        self._ensure_open()
+        self._finalize_order(
+            order_id=order_id,
+            obligation_terminal="TERMINATED_EXPIRED",
+            order_final="FINALIZED_EXPIRED",
+            now=now,
+        )
+
+    def terminate_cancelled(
+        self, *, order_id: str, operator: str, reason: str, now: datetime
+    ) -> None:
+        self._ensure_open()
+        if type(operator) is not str or not operator or type(reason) is not str or not reason:
+            raise StoreError("terminate_cancelled received invalid arguments")
+        self._finalize_order(
+            order_id=order_id,
+            obligation_terminal="TERMINATED_CANCELLED",
+            order_final="FINALIZED_CANCELLED",
+            now=now,
+        )
+
+    def get_obligation_status(self, order_id: str) -> str | None:
+        self._ensure_open()
+        if type(order_id) is not str or not order_id:
+            raise StoreError("get_obligation_status received an invalid order id")
+        try:
+            row = self._connection.execute(
+                "SELECT status FROM execution_obligations WHERE order_id = ?", [order_id]
+            ).fetchone()
+        except sqlite3.Error:
+            raise StoreError("obligation read failed") from None
+        return None if row is None else str(row[0])
 
     # ── internal helpers ────────────────────────────────────────────────────
 
