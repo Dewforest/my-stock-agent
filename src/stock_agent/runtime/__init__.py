@@ -14,6 +14,12 @@ from stock_agent.runtime.calendars import (
     TradingSession,
     canonical_schedule_digest,
 )
+from stock_agent.runtime.decision import (
+    DecisionCoordinator,
+    DecisionOutcome,
+    DecisionResult,
+    RuntimeInvocationBoundary,
+)
 from stock_agent.runtime.identities import (
     RunIdentity,
     run_config_digest_for,
@@ -61,6 +67,7 @@ from stock_agent.runtime.store import (
     BudgetKind,
     ClaimOutcome,
     ClaimResult,
+    DecisionInvocationStatus,
     LeaseHeldError,
     RunConflictError,
     RuntimeStore,
@@ -94,6 +101,10 @@ __all__ = [
     "CalendarLookupStatus",
     "ClaimOutcome",
     "ClaimResult",
+    "DecisionCoordinator",
+    "DecisionInvocationStatus",
+    "DecisionOutcome",
+    "DecisionResult",
     "EvidenceClass",
     "Exchange",
     "ExchangeSchedule",
@@ -114,6 +125,7 @@ __all__ = [
     "RunPhase",
     "RuntimeAttempt",
     "RuntimeConfigLoadError",
+    "RuntimeInvocationBoundary",
     "RuntimeMarketSchedule",
     "RuntimeRun",
     "RuntimeStore",

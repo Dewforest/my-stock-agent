@@ -66,6 +66,13 @@ class BudgetClaimOutcome(StrEnum):
     CIRCUIT_OPEN = "CIRCUIT_OPEN"
 
 
+class DecisionInvocationStatus(StrEnum):
+    SEND_INTENT_RECORDED = "SEND_INTENT_RECORDED"
+    DECISION_RECORDED = "DECISION_RECORDED"
+    NEEDS_RECONCILIATION = "NEEDS_RECONCILIATION"
+    ABANDONED_NO_ORDER = "ABANDONED_NO_ORDER"
+
+
 class ClaimResult(RuntimeModel):
     outcome: ClaimOutcome
     run: RuntimeRun
@@ -204,6 +211,30 @@ class RuntimeStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS decision_invocations (
+                run_id TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                decision_id TEXT,
+                marked_at TEXT NOT NULL,
+                resolved_at TEXT
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reconciliation_records (
+                record_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                occurred_at TEXT NOT NULL
+            )
+            """
+        )
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -246,14 +277,10 @@ class RuntimeStore:
             existing = self._fetch_run_by_key(run_key)
             if existing is not None:
                 if existing.config_digest != config_digest:
-                    raise RunConflictError(
-                        "same run key reappeared with a different config digest"
-                    )
+                    raise RunConflictError("same run key reappeared with a different config digest")
                 if existing.is_terminal:
                     self._connection.execute("COMMIT")
-                    return ClaimResult(
-                        outcome=ClaimOutcome.RESUMED, run=existing, attempt=None
-                    )
+                    return ClaimResult(outcome=ClaimOutcome.RESUMED, run=existing, attempt=None)
 
                 lease = self._fetch_lease(existing.run_id)
                 if lease is not None and lease[0] > now:
@@ -265,9 +292,7 @@ class RuntimeStore:
                 )
                 self._upsert_lease(existing.run_id, attempt.attempt_id, expires_at)
                 self._connection.execute("COMMIT")
-                return ClaimResult(
-                    outcome=ClaimOutcome.RECOVERED, run=existing, attempt=attempt
-                )
+                return ClaimResult(outcome=ClaimOutcome.RECOVERED, run=existing, attempt=attempt)
 
             run = RuntimeRun(
                 run_id=run_id,
@@ -301,9 +326,7 @@ class RuntimeStore:
             if run.is_terminal:
                 raise StoreError("terminal run cannot be mutated")
             if not is_legal_transition(run.phase, to_phase):
-                raise StoreError(
-                    f"illegal transition {run.phase.value} -> {to_phase.value}"
-                )
+                raise StoreError(f"illegal transition {run.phase.value} -> {to_phase.value}")
             updated_at = datetime.now(UTC)
             self._connection.execute(
                 "UPDATE runs SET phase = ?, updated_at = ? WHERE run_id = ?",
@@ -503,8 +526,7 @@ class RuntimeStore:
             raise StoreError("is_circuit_open received invalid arguments")
         try:
             row = self._connection.execute(
-                "SELECT circuit_open FROM provider_day_budgets "
-                "WHERE provider_id = ? AND day = ?",
+                "SELECT circuit_open FROM provider_day_budgets WHERE provider_id = ? AND day = ?",
                 [provider_id, day.isoformat()],
             ).fetchone()
         except sqlite3.Error:
@@ -650,6 +672,191 @@ class RuntimeStore:
         if row is None:
             return None
         return (str(row[0]), str(row[1]), str(row[2]))
+
+    # ── decision invocations and reconciliation ─────────────────────────────
+
+    def mark_send_intent(self, run_id: str, request_fingerprint: str, now: datetime) -> None:
+        self._ensure_open()
+        if (
+            type(run_id) is not str
+            or not run_id
+            or type(request_fingerprint) is not str
+            or not request_fingerprint
+            or type(now) is not datetime
+            or now.tzinfo is None
+        ):
+            raise StoreError("mark_send_intent received invalid arguments")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT status, request_fingerprint FROM decision_invocations WHERE run_id = ?",
+                [run_id],
+            ).fetchone()
+            if row is not None:
+                status, fingerprint = str(row[0]), str(row[1])
+                if (
+                    status == DecisionInvocationStatus.SEND_INTENT_RECORDED.value
+                    and fingerprint == request_fingerprint
+                ):
+                    self._connection.execute("COMMIT")
+                    return
+                if fingerprint != request_fingerprint:
+                    raise StoreError("send intent fingerprint conflict")
+                raise StoreError("run already advanced past send intent")
+            self._connection.execute(
+                "INSERT INTO decision_invocations "
+                "(run_id, request_fingerprint, status, decision_id, marked_at, resolved_at) "
+                "VALUES (?, ?, ?, NULL, ?, NULL)",
+                [
+                    run_id,
+                    request_fingerprint,
+                    DecisionInvocationStatus.SEND_INTENT_RECORDED.value,
+                    canonical_datetime(now),
+                ],
+            )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def record_decision(self, run_id: str, decision_id: str, now: datetime) -> None:
+        self._ensure_open()
+        if (
+            type(run_id) is not str
+            or not run_id
+            or type(decision_id) is not str
+            or not decision_id
+            or type(now) is not datetime
+            or now.tzinfo is None
+        ):
+            raise StoreError("record_decision received invalid arguments")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT status, decision_id FROM decision_invocations WHERE run_id = ?",
+                [run_id],
+            ).fetchone()
+            if row is None:
+                raise StoreError("decision recorded without a prior send intent")
+            status = str(row[0])
+            existing = None if row[1] is None else str(row[1])
+            if status == DecisionInvocationStatus.DECISION_RECORDED.value:
+                if existing == decision_id:
+                    self._connection.execute("COMMIT")
+                    return
+                raise StoreError("decision identity conflict")
+            if status != DecisionInvocationStatus.SEND_INTENT_RECORDED.value:
+                raise StoreError("run cannot transition to decision recorded")
+            self._connection.execute(
+                "UPDATE decision_invocations SET status = ?, decision_id = ?, resolved_at = ? "
+                "WHERE run_id = ?",
+                [
+                    DecisionInvocationStatus.DECISION_RECORDED.value,
+                    decision_id,
+                    canonical_datetime(now),
+                    run_id,
+                ],
+            )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def mark_needs_reconciliation(self, run_id: str, now: datetime) -> None:
+        self._ensure_open()
+        if type(run_id) is not str or not run_id or type(now) is not datetime or now.tzinfo is None:
+            raise StoreError("mark_needs_reconciliation received invalid arguments")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT status FROM decision_invocations WHERE run_id = ?", [run_id]
+            ).fetchone()
+            if row is None:
+                raise StoreError("reconciliation marked without a prior send intent")
+            if str(row[0]) == DecisionInvocationStatus.SEND_INTENT_RECORDED.value:
+                self._connection.execute(
+                    "UPDATE decision_invocations SET status = ?, resolved_at = ? WHERE run_id = ?",
+                    [
+                        DecisionInvocationStatus.NEEDS_RECONCILIATION.value,
+                        canonical_datetime(now),
+                        run_id,
+                    ],
+                )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def get_decision_invocation(self, run_id: str) -> tuple[str, str, str | None] | None:
+        self._ensure_open()
+        if type(run_id) is not str or not run_id:
+            raise StoreError("get_decision_invocation received an invalid run id")
+        try:
+            row = self._connection.execute(
+                "SELECT status, request_fingerprint, decision_id FROM decision_invocations "
+                "WHERE run_id = ?",
+                [run_id],
+            ).fetchone()
+        except sqlite3.Error:
+            raise StoreError("decision invocation read failed") from None
+        if row is None:
+            return None
+        return (str(row[0]), str(row[1]), None if row[2] is None else str(row[2]))
+
+    def abandon_decision(
+        self,
+        *,
+        run_id: str,
+        operator: str,
+        reason: str,
+        request_fingerprint: str,
+        now: datetime,
+    ) -> None:
+        self._ensure_open()
+        if (
+            type(run_id) is not str
+            or not run_id
+            or type(operator) is not str
+            or not operator
+            or type(reason) is not str
+            or not reason
+            or type(request_fingerprint) is not str
+            or not request_fingerprint
+            or type(now) is not datetime
+            or now.tzinfo is None
+        ):
+            raise StoreError("abandon_decision received invalid arguments")
+        record_id = tagged_sha256(
+            "reconciliation-record",
+            (run_id, operator, reason, request_fingerprint, canonical_datetime(now)),
+        )
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT status FROM decision_invocations WHERE run_id = ?", [run_id]
+            ).fetchone()
+            if row is None:
+                raise StoreError("abandon targets an unknown decision invocation")
+            if str(row[0]) != DecisionInvocationStatus.NEEDS_RECONCILIATION.value:
+                raise StoreError("only a needs-reconciliation run can be abandoned")
+            self._connection.execute(
+                "INSERT INTO reconciliation_records "
+                "(record_id, run_id, operator, reason, request_fingerprint, occurred_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [record_id, run_id, operator, reason, request_fingerprint, canonical_datetime(now)],
+            )
+            self._connection.execute(
+                "UPDATE decision_invocations SET status = ?, resolved_at = ? WHERE run_id = ?",
+                [
+                    DecisionInvocationStatus.ABANDONED_NO_ORDER.value,
+                    canonical_datetime(now),
+                    run_id,
+                ],
+            )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
 
     # ── internal helpers ────────────────────────────────────────────────────
 
