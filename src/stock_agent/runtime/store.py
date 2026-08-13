@@ -277,10 +277,27 @@ class RuntimeStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ledger_events (
+                account_id TEXT NOT NULL,
+                event_index INTEGER NOT NULL,
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE (account_id, event_index)
+            )
+            """
+        )
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise StoreClosedError("runtime store is closed")
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        self._ensure_open()
+        return self._connection
 
     def close(self) -> None:
         if self._closed:

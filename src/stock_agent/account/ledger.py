@@ -28,9 +28,7 @@ from pydantic import (
 from stock_agent.domain import Market, PortfolioSnapshot, Position, Side
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-Symbol = Annotated[
-    str, StringConstraints(strip_whitespace=True, to_upper=True, min_length=1)
-]
+Symbol = Annotated[str, StringConstraints(strip_whitespace=True, to_upper=True, min_length=1)]
 
 
 def _utc_instant(value: datetime) -> datetime:
@@ -75,9 +73,7 @@ def _validate_finite_decimal(value: object) -> Decimal:
     return value
 
 
-LotPositiveDecimal = Annotated[
-    Decimal, BeforeValidator(_validate_finite_decimal), Field(gt=0)
-]
+LotPositiveDecimal = Annotated[Decimal, BeforeValidator(_validate_finite_decimal), Field(gt=0)]
 
 
 class _CopySafeMixin:
@@ -93,9 +89,7 @@ class _CopySafeMixin:
             raise TypeError("immutable ledger models do not support copy projections or updates")
         return super().copy(deep=deep)  # type: ignore[misc]
 
-    def model_copy(
-        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
-    ) -> Self:
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
         if update is not None:
             raise TypeError("immutable ledger models do not support copy projections or updates")
         return super().model_copy(deep=deep)  # type: ignore[misc]
@@ -411,9 +405,7 @@ class PortfolioLedger:
 
         as_of_instant = _utc_instant(as_of)
         prefix = tuple(
-            event
-            for event in self._events
-            if _utc_instant(event.occurred_at) <= as_of_instant
+            event for event in self._events if _utc_instant(event.occurred_at) <= as_of_instant
         )
         if not prefix:
             raise RuntimeError("cash has not been initialized")
@@ -437,6 +429,15 @@ class PortfolioLedger:
             raise TypeError("events must contain exact LedgerEvent values")
 
         self._commit_candidates(events)
+
+    @classmethod
+    def rebuild(
+        cls, account_id: str, market: Market, events: tuple[LedgerEvent, ...]
+    ) -> "PortfolioLedger":
+        """Reconstruct a ledger by exact deterministic replay of persisted events."""
+        ledger = cls(account_id, market)
+        ledger.append_many(events)
+        return ledger
 
     def _commit_candidates(self, events: tuple[LedgerEvent, ...]) -> None:
         for event in events:
@@ -667,9 +668,7 @@ class PortfolioLedger:
             allocated_cost = context.add(allocated_cost, lot_cost)
             remaining_to_sell = context.subtract(remaining_to_sell, take)
         new_cash = context.add(cash, proceeds)
-        new_realized_pnl = context.add(
-            realized_pnl, context.subtract(proceeds, allocated_cost)
-        )
+        new_realized_pnl = context.add(realized_pnl, context.subtract(proceeds, allocated_cost))
         cls._require_finite(allocated_cost, new_cash, new_realized_pnl)
         if not holding.lots:
             del holdings[symbol]
@@ -720,9 +719,7 @@ class PortfolioLedger:
         return value if rounded == value else rounded
 
     @staticmethod
-    def _public_positions(
-        holdings: dict[str, _Holding], context: Context
-    ) -> tuple[Position, ...]:
+    def _public_positions(holdings: dict[str, _Holding], context: Context) -> tuple[Position, ...]:
         result = []
         for symbol in sorted(holdings):
             holding = holdings[symbol]

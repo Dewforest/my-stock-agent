@@ -26,6 +26,7 @@ from stock_agent.runtime.identities import (
     run_id_for,
     run_key_for,
 )
+from stock_agent.runtime.ledger_store import LedgerStore, LedgerStoreError
 from stock_agent.runtime.market_data import (
     BatchReport,
     MarketDataBatchOrchestrator,
@@ -123,6 +124,8 @@ __all__ = [
     "KillSwitch",
     "KillSwitchScope",
     "LeaseHeldError",
+    "LedgerStore",
+    "LedgerStoreError",
     "MarketAccountProfile",
     "MarketDataBatchOrchestrator",
     "MarketDataProviderProfile",
