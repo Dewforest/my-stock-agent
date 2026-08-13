@@ -194,6 +194,16 @@ class RuntimeStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshot_manifests (
+                run_id TEXT PRIMARY KEY,
+                market TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -588,6 +598,58 @@ class RuntimeStore:
         except sqlite3.Error:
             raise StoreError("symbol attempt read failed") from None
         return row is not None
+
+    # ── snapshot manifests ──────────────────────────────────────────────────
+
+    def store_snapshot_manifest(
+        self,
+        *,
+        run_id: str,
+        market: Market,
+        digest: str,
+        payload: str,
+    ) -> None:
+        self._ensure_open()
+        if (
+            type(run_id) is not str
+            or not run_id
+            or type(market) is not Market
+            or type(digest) is not str
+            or not digest
+            or type(payload) is not str
+        ):
+            raise StoreError("store_snapshot_manifest received invalid arguments")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT digest FROM snapshot_manifests WHERE run_id = ?", [run_id]
+            ).fetchone()
+            if row is not None and row[0] != digest:
+                raise StoreError("snapshot manifest identity conflict")
+            self._connection.execute(
+                "INSERT OR REPLACE INTO snapshot_manifests "
+                "(run_id, market, digest, payload) VALUES (?, ?, ?, ?)",
+                [run_id, market.value, digest, payload],
+            )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def load_snapshot_manifest(self, run_id: str) -> tuple[str, str, str] | None:
+        self._ensure_open()
+        if type(run_id) is not str or not run_id:
+            raise StoreError("load_snapshot_manifest received an invalid run id")
+        try:
+            row = self._connection.execute(
+                "SELECT market, digest, payload FROM snapshot_manifests WHERE run_id = ?",
+                [run_id],
+            ).fetchone()
+        except sqlite3.Error:
+            raise StoreError("snapshot manifest read failed") from None
+        if row is None:
+            return None
+        return (str(row[0]), str(row[1]), str(row[2]))
 
     # ── internal helpers ────────────────────────────────────────────────────
 
