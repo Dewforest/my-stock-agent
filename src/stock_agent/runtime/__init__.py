@@ -58,6 +58,12 @@ from stock_agent.runtime.keychain import (
     KeychainSecretSource,
     Secret,
 )
+from stock_agent.runtime.launchd import (
+    LABEL,
+    generate_plist,
+    load_plist,
+    validate_with_plutil,
+)
 from stock_agent.runtime.ledger_store import LedgerStore, LedgerStoreError
 from stock_agent.runtime.lock import LockHeldError, ProcessLock
 from stock_agent.runtime.market_data import (
@@ -163,6 +169,7 @@ __all__ = [
     "EXIT_RETRYABLE_FAILURE",
     "EXPECTED_RUNTIME_CONFIG_V1_DIGEST",
     "EXPECTED_UNIVERSE_V1_DIGEST",
+    "LABEL",
     "LAUNCHAGENT_KEYCHAIN_ACL",
     "TERMINAL_RUN_PHASES",
     "AttemptKind",
@@ -257,9 +264,11 @@ __all__ = [
     "emit_envelope",
     "evaluate_and_persist",
     "freeze_snapshot",
+    "generate_plist",
     "is_legal_transition",
     "is_terminal_phase",
     "load_paper_runtime_config",
+    "load_plist",
     "manifest_from_payload",
     "manifest_to_payload",
     "obligation_is_terminal",
@@ -274,4 +283,5 @@ __all__ = [
     "run_config_digest_for",
     "run_id_for",
     "run_key_for",
+    "validate_with_plutil",
 ]
