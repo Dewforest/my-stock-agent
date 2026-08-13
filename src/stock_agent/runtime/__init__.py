@@ -31,6 +31,11 @@ from stock_agent.runtime.decision import (
     DecisionResult,
     RuntimeInvocationBoundary,
 )
+from stock_agent.runtime.execution import (
+    ExecutionAdapter,
+    ExecutionOutcome,
+    ExecutionResult,
+)
 from stock_agent.runtime.identities import (
     RunIdentity,
     run_config_digest_for,
@@ -142,9 +147,12 @@ __all__ = [
     "EvidenceClass",
     "Exchange",
     "ExchangeSchedule",
+    "ExecutionAdapter",
     "ExecutionAuthorityBlockedError",
     "ExecutionObligation",
     "ExecutionObligationStatus",
+    "ExecutionOutcome",
+    "ExecutionResult",
     "KeychainItemProfile",
     "KillSwitch",
     "KillSwitchScope",
