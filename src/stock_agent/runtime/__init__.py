@@ -25,6 +25,7 @@ from stock_agent.runtime.capability_gates import (
     CorporateActionAuthorityBlockedError,
     ExecutionAuthorityBlockedError,
 )
+from stock_agent.runtime.clock import MarketClock
 from stock_agent.runtime.decision import (
     DecisionCoordinator,
     DecisionOutcome,
@@ -57,6 +58,12 @@ from stock_agent.runtime.models import (
     ModelRuntimeProfile,
     ScheduleReference,
     StrategyRuntimeProfile,
+)
+from stock_agent.runtime.orchestrator import (
+    MarketOutcome,
+    MarketReport,
+    OrchestrationReport,
+    RunOnceOrchestrator,
 )
 from stock_agent.runtime.orders import (
     build_pending_orders,
@@ -160,10 +167,14 @@ __all__ = [
     "LedgerStore",
     "LedgerStoreError",
     "MarketAccountProfile",
+    "MarketClock",
     "MarketDataBatchOrchestrator",
     "MarketDataProviderProfile",
+    "MarketOutcome",
+    "MarketReport",
     "MarketScheduleProjection",
     "ModelRuntimeProfile",
+    "OrchestrationReport",
     "OrderStatus",
     "PaperRuntimeConfig",
     "PendingOrder",
@@ -172,6 +183,7 @@ __all__ = [
     "RiskResultEnvelope",
     "RunConflictError",
     "RunIdentity",
+    "RunOnceOrchestrator",
     "RunPhase",
     "RuntimeAttempt",
     "RuntimeConfigLoadError",
