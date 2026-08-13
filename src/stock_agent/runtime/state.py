@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from datetime import date
+from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Self
 
 from pydantic import AwareDatetime, StringConstraints
 
+from stock_agent.domain import Market, Side
 from stock_agent.runtime.models import RuntimeModel
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -150,3 +153,37 @@ class KillSwitch(RuntimeModel):
         elif not self.scope_value:
             raise ValueError("scoped kill switch requires a nonblank scope value")
         return self
+
+
+class OrderStatus(StrEnum):
+    PENDING = "PENDING"
+
+
+class PendingOrder(RuntimeModel):
+    order_id: str
+    run_id: str
+    symbol: NonEmptyStr
+    market: Market
+    side: Side
+    target_weight: Decimal
+    intended_session_date: date
+    ordinal: int
+    status: OrderStatus = OrderStatus.PENDING
+
+    def validate_order(self) -> Self:
+        if self.target_weight < 0 or self.target_weight > 1:
+            raise ValueError("target_weight must be a unit decimal")
+        if self.ordinal <= 0:
+            raise ValueError("ordinal must be positive")
+        if self.side is Side.SELL and self.target_weight != 0:
+            raise ValueError("SELL orders must have zero target weight")
+        return self
+
+
+class RiskResultEnvelope(RuntimeModel):
+    run_id: str
+    symbol: NonEmptyStr
+    status: NonEmptyStr
+    approved_target_weight: Decimal | None
+    rule_ids: tuple[str, ...]
+    reasons: tuple[str, ...]

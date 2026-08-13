@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
 
 from pydantic import StringConstraints
 
-from stock_agent.audit.canonical import canonical_datetime, tagged_sha256
-from stock_agent.domain import Market
+from stock_agent.audit.canonical import canonical_datetime, canonical_decimal, tagged_sha256
+from stock_agent.domain import Market, Side
 from stock_agent.runtime.identities import (
     RunIdentity,
     run_config_digest_for,
@@ -23,6 +25,8 @@ from stock_agent.runtime.state import (
     AttemptPhase,
     KillSwitch,
     KillSwitchScope,
+    PendingOrder,
+    RiskResultEnvelope,
     RunPhase,
     RuntimeAttempt,
     RuntimeRun,
@@ -232,6 +236,44 @@ class RuntimeStore:
                 reason TEXT NOT NULL,
                 request_fingerprint TEXT NOT NULL,
                 occurred_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS risk_results (
+                run_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                status TEXT NOT NULL,
+                approved_target_weight TEXT,
+                rule_ids TEXT NOT NULL,
+                reasons TEXT NOT NULL,
+                PRIMARY KEY (run_id, symbol)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_orders (
+                order_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                market TEXT NOT NULL,
+                side TEXT NOT NULL,
+                target_weight TEXT NOT NULL,
+                intended_session_date TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                UNIQUE (run_id, ordinal)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_sets (
+                run_id TEXT PRIMARY KEY,
+                digest TEXT NOT NULL,
+                committed_at TEXT NOT NULL
             )
             """
         )
@@ -857,6 +899,149 @@ class RuntimeStore:
         except Exception:
             self._connection.execute("ROLLBACK")
             raise
+
+    # ── risk results and pending orders ─────────────────────────────────────
+
+    def persist_risk_results(
+        self, run_id: str, envelopes: tuple[RiskResultEnvelope, ...], now: datetime
+    ) -> None:
+        self._ensure_open()
+        if type(run_id) is not str or not run_id or type(envelopes) is not tuple or not envelopes:
+            raise StoreError("persist_risk_results received invalid arguments")
+        if any(type(item) is not RiskResultEnvelope for item in envelopes):
+            raise StoreError("risk envelopes must be exact RiskResultEnvelope values")
+        try:
+            for envelope in envelopes:
+                self._connection.execute(
+                    "INSERT OR REPLACE INTO risk_results "
+                    "(run_id, symbol, status, approved_target_weight, rule_ids, reasons) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        run_id,
+                        envelope.symbol,
+                        envelope.status,
+                        None
+                        if envelope.approved_target_weight is None
+                        else canonical_decimal(envelope.approved_target_weight),
+                        json.dumps(envelope.rule_ids, separators=(",", ":")),
+                        json.dumps(envelope.reasons, separators=(",", ":")),
+                    ],
+                )
+        except sqlite3.Error:
+            raise StoreError("risk result persistence failed") from None
+
+    def persist_orders(
+        self, *, run_id: str, orders: tuple[PendingOrder, ...], digest: str, now: datetime
+    ) -> None:
+        self._ensure_open()
+        if (
+            type(run_id) is not str
+            or not run_id
+            or type(orders) is not tuple
+            or not orders
+            or type(digest) is not str
+            or not digest
+            or type(now) is not datetime
+            or now.tzinfo is None
+        ):
+            raise StoreError("persist_orders received invalid arguments")
+        if any(type(item) is not PendingOrder for item in orders):
+            raise StoreError("orders must be exact PendingOrder values")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT digest FROM order_sets WHERE run_id = ?", [run_id]
+            ).fetchone()
+            if row is not None:
+                if str(row[0]) == digest:
+                    self._connection.execute("COMMIT")
+                    return
+                raise StoreError("order set digest conflict")
+            for order in orders:
+                existing = self._connection.execute(
+                    "SELECT symbol, market, side, target_weight, intended_session_date, "
+                    "ordinal, status FROM pending_orders WHERE order_id = ?",
+                    [order.order_id],
+                ).fetchone()
+                payload = self._order_payload(order)
+                if existing is not None and tuple(str(v) for v in existing) != tuple(payload[1:]):
+                    raise StoreError("pending order identity conflict")
+                self._connection.execute(
+                    "INSERT OR REPLACE INTO pending_orders "
+                    "(order_id, run_id, symbol, market, side, target_weight, "
+                    "intended_session_date, ordinal, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [order.order_id, *payload],
+                )
+            self._connection.execute(
+                "INSERT INTO order_sets (run_id, digest, committed_at) VALUES (?, ?, ?)",
+                [run_id, digest, canonical_datetime(now)],
+            )
+            self._connection.execute("COMMIT")
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def load_orders(self, run_id: str) -> tuple[tuple[PendingOrder, ...], str] | None:
+        self._ensure_open()
+        if type(run_id) is not str or not run_id:
+            raise StoreError("load_orders received an invalid run id")
+        try:
+            digest_row = self._connection.execute(
+                "SELECT digest FROM order_sets WHERE run_id = ?", [run_id]
+            ).fetchone()
+            if digest_row is None:
+                return None
+            rows = self._connection.execute(
+                "SELECT order_id, run_id, symbol, market, side, target_weight, "
+                "intended_session_date, ordinal, status FROM pending_orders "
+                "WHERE run_id = ? ORDER BY ordinal",
+                [run_id],
+            ).fetchall()
+        except sqlite3.Error:
+            raise StoreError("order read failed") from None
+        orders = tuple(self._decode_order(row) for row in rows)
+        return (orders, str(digest_row[0]))
+
+    def load_order_set_digest(self, run_id: str) -> str | None:
+        self._ensure_open()
+        if type(run_id) is not str or not run_id:
+            raise StoreError("load_order_set_digest received an invalid run id")
+        try:
+            row = self._connection.execute(
+                "SELECT digest FROM order_sets WHERE run_id = ?", [run_id]
+            ).fetchone()
+        except sqlite3.Error:
+            raise StoreError("order set digest read failed") from None
+        return None if row is None else str(row[0])
+
+    @staticmethod
+    def _order_payload(order: PendingOrder) -> list[str]:
+        return [
+            order.run_id,
+            order.symbol,
+            order.market.value,
+            order.side.value,
+            canonical_decimal(order.target_weight),
+            order.intended_session_date.isoformat(),
+            str(order.ordinal),
+            order.status.value,
+        ]
+
+    @staticmethod
+    def _decode_order(row: tuple[object, ...]) -> PendingOrder:
+        from stock_agent.runtime.state import OrderStatus
+
+        return PendingOrder(
+            order_id=str(row[0]),
+            run_id=str(row[1]),
+            symbol=str(row[2]),
+            market=Market(str(row[3])),
+            side=Side(str(row[4])),
+            target_weight=Decimal(str(row[5])),
+            intended_session_date=date.fromisoformat(str(row[6])),
+            ordinal=int(str(row[7])),
+            status=OrderStatus(str(row[8])),
+        )
 
     # ── internal helpers ────────────────────────────────────────────────────
 
