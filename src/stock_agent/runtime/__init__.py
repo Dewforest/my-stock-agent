@@ -43,6 +43,12 @@ from stock_agent.runtime.identities import (
     run_id_for,
     run_key_for,
 )
+from stock_agent.runtime.keychain import (
+    APPROVED_KEYCHAIN_SERVICES,
+    KeychainError,
+    KeychainSecretSource,
+    Secret,
+)
 from stock_agent.runtime.ledger_store import LedgerStore, LedgerStoreError
 from stock_agent.runtime.market_data import (
     BatchReport,
@@ -137,6 +143,7 @@ from stock_agent.runtime.universe import (
 
 __all__ = [
     "ANNUAL_CALENDARS",
+    "APPROVED_KEYCHAIN_SERVICES",
     "CORPORATE_ACTIONS",
     "EXECUTION_OPEN_AND_CN_SESSION_STATE",
     "EXPECTED_RUNTIME_CONFIG_V1_DIGEST",
@@ -170,7 +177,9 @@ __all__ = [
     "ExecutionObligationStatus",
     "ExecutionOutcome",
     "ExecutionResult",
+    "KeychainError",
     "KeychainItemProfile",
+    "KeychainSecretSource",
     "KillSwitch",
     "KillSwitchScope",
     "LeaseHeldError",
@@ -205,6 +214,7 @@ __all__ = [
     "RuntimeStore",
     "ScheduleProvenance",
     "ScheduleReference",
+    "Secret",
     "SessionSegment",
     "SnapshotIncompleteError",
     "SnapshotManifest",
