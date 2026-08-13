@@ -95,6 +95,14 @@ class InvocationBoundary(Protocol):
 
     def end_at(self, invocation: InvocationStart) -> datetime: ...
 
+    # Optional: invoked immediately before the transport send boundary. A
+    # runtime coordination layer may persist a SEND_INTENT marker here so a
+    # crash after this point can be distinguished from a proven pre-send
+    # failure. Implementations that omit it simply skip the marker.
+    def mark_send_intent(
+        self, invocation: InvocationStart, request: LLMDecisionRequest
+    ) -> None: ...
+
 
 class DecisionJournal(Protocol):
     def append_attempt(
@@ -128,6 +136,13 @@ class RecordedLLMDecisionProvider:
         invocation = self._begin()
         if not self._model_policy.accepts_request(request):
             self._fail(request, invocation, LLMDecisionStatus.IDENTITY_POLICY)
+
+        marker = getattr(self._boundary, "mark_send_intent", None)
+        if marker is not None:
+            try:
+                marker(invocation, request)
+            except Exception:
+                self._fail(request, invocation, LLMDecisionStatus.AUDIT_PERSISTENCE)
 
         try:
             raw = self._transport.invoke(request)
@@ -283,9 +298,7 @@ def _exact_request(request: object) -> LLMDecisionRequest:
     try:
         if set(request.__dict__) != set(LLMDecisionRequest.model_fields):
             raise ValueError("polluted request")
-        fields = {
-            name: getattr(request, name) for name in LLMDecisionRequest.model_fields
-        }
+        fields = {name: getattr(request, name) for name in LLMDecisionRequest.model_fields}
         return LLMDecisionRequest.model_validate(fields, strict=True)
     except (AttributeError, TypeError, ValueError, ValidationError):
         raise LLMProviderError(LLMDecisionStatus.SCHEMA) from None

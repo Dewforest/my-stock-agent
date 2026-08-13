@@ -12,3 +12,7 @@ htmlcov/
 !.env.example
 !.env.template
 .DS_Store
+
+# Derived exchange calendars are private runtime data, never repository artifacts.
+config/calendars/private/
+.runtime/calendars/

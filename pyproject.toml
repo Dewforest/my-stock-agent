@@ -12,6 +12,9 @@ dependencies = [
     "typer>=0.16,<1",
 ]
 
+[project.scripts]
+stock-agent = "stock_agent.runtime.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.4,<9",
