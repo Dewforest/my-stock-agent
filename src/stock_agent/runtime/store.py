@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -53,6 +53,17 @@ class ClaimOutcome(StrEnum):
     CREATED = "CREATED"
     RESUMED = "RESUMED"
     RECOVERED = "RECOVERED"
+
+
+class BudgetKind(StrEnum):
+    NORMAL = "NORMAL"
+    RECOVERY = "RECOVERY"
+
+
+class BudgetClaimOutcome(StrEnum):
+    CLAIMED = "CLAIMED"
+    EXHAUSTED = "EXHAUSTED"
+    CIRCUIT_OPEN = "CIRCUIT_OPEN"
 
 
 class ClaimResult(RuntimeModel):
@@ -148,6 +159,38 @@ class RuntimeStore:
                 set_by TEXT NOT NULL,
                 set_at TEXT NOT NULL,
                 PRIMARY KEY (scope, scope_value)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provider_day_budgets (
+                provider_id TEXT NOT NULL,
+                day TEXT NOT NULL,
+                normal_limit INTEGER NOT NULL,
+                recovery_limit INTEGER NOT NULL,
+                reserved INTEGER NOT NULL,
+                normal_spent INTEGER NOT NULL DEFAULT 0,
+                recovery_spent INTEGER NOT NULL DEFAULT 0,
+                circuit_open INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (provider_id, day)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS symbol_fetch_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                provider_id TEXT NOT NULL,
+                market TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                session_date TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error_code TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL,
+                UNIQUE (provider_id, market, symbol, session_date, attempt_number)
             )
             """
         )
@@ -347,6 +390,204 @@ class RuntimeStore:
         except sqlite3.Error:
             raise StoreError("kill switch read failed") from None
         return any(row[0] for row in rows)
+
+    # ── provider budgets and symbol attempts ───────────────────────────────
+
+    def ensure_provider_budget(
+        self,
+        provider_id: str,
+        day: date,
+        *,
+        normal_limit: int,
+        recovery_limit: int,
+        reserved: int,
+    ) -> None:
+        self._ensure_open()
+        if (
+            type(provider_id) is not str
+            or not provider_id
+            or type(day) is not date
+            or type(normal_limit) is not int
+            or normal_limit <= 0
+            or type(recovery_limit) is not int
+            or recovery_limit < 0
+            or type(reserved) is not int
+            or reserved < 0
+        ):
+            raise StoreError("ensure_provider_budget received invalid arguments")
+        try:
+            self._connection.execute(
+                "INSERT OR IGNORE INTO provider_day_budgets "
+                "(provider_id, day, normal_limit, recovery_limit, reserved, "
+                "normal_spent, recovery_spent, circuit_open) "
+                "VALUES (?, ?, ?, ?, ?, 0, 0, 0)",
+                [provider_id, day.isoformat(), normal_limit, recovery_limit, reserved],
+            )
+        except sqlite3.Error:
+            raise StoreError("provider budget ensure failed") from None
+
+    def claim_provider_budget(
+        self, provider_id: str, day: date, kind: BudgetKind
+    ) -> BudgetClaimOutcome:
+        self._ensure_open()
+        if (
+            type(provider_id) is not str
+            or not provider_id
+            or type(day) is not date
+            or type(kind) is not BudgetKind
+        ):
+            raise StoreError("claim_provider_budget received invalid arguments")
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._connection.execute(
+                "SELECT circuit_open, normal_spent, normal_limit, "
+                "recovery_spent, recovery_limit FROM provider_day_budgets "
+                "WHERE provider_id = ? AND day = ?",
+                [provider_id, day.isoformat()],
+            ).fetchone()
+            if row is None:
+                raise StoreError("provider budget row does not exist")
+            if bool(row[0]):
+                self._connection.execute("COMMIT")
+                return BudgetClaimOutcome.CIRCUIT_OPEN
+            if kind is BudgetKind.NORMAL:
+                if int(row[1]) >= int(row[2]):
+                    self._connection.execute("COMMIT")
+                    return BudgetClaimOutcome.EXHAUSTED
+                self._connection.execute(
+                    "UPDATE provider_day_budgets SET normal_spent = normal_spent + 1 "
+                    "WHERE provider_id = ? AND day = ?",
+                    [provider_id, day.isoformat()],
+                )
+            else:
+                if int(row[3]) >= int(row[4]):
+                    self._connection.execute("COMMIT")
+                    return BudgetClaimOutcome.EXHAUSTED
+                self._connection.execute(
+                    "UPDATE provider_day_budgets SET recovery_spent = recovery_spent + 1 "
+                    "WHERE provider_id = ? AND day = ?",
+                    [provider_id, day.isoformat()],
+                )
+            self._connection.execute("COMMIT")
+            return BudgetClaimOutcome.CLAIMED
+        except Exception:
+            self._connection.execute("ROLLBACK")
+            raise
+
+    def open_provider_circuit(self, provider_id: str, day: date) -> None:
+        self._ensure_open()
+        if type(provider_id) is not str or not provider_id or type(day) is not date:
+            raise StoreError("open_provider_circuit received invalid arguments")
+        try:
+            self._connection.execute(
+                "UPDATE provider_day_budgets SET circuit_open = 1 "
+                "WHERE provider_id = ? AND day = ?",
+                [provider_id, day.isoformat()],
+            )
+        except sqlite3.Error:
+            raise StoreError("provider circuit update failed") from None
+
+    def is_circuit_open(self, provider_id: str, day: date) -> bool:
+        self._ensure_open()
+        if type(provider_id) is not str or not provider_id or type(day) is not date:
+            raise StoreError("is_circuit_open received invalid arguments")
+        try:
+            row = self._connection.execute(
+                "SELECT circuit_open FROM provider_day_budgets "
+                "WHERE provider_id = ? AND day = ?",
+                [provider_id, day.isoformat()],
+            ).fetchone()
+        except sqlite3.Error:
+            raise StoreError("provider circuit read failed") from None
+        return row is not None and bool(row[0])
+
+    def record_symbol_attempt(
+        self,
+        *,
+        provider_id: str,
+        market: Market,
+        symbol: str,
+        session_date: date,
+        attempt_number: int,
+        status: str,
+        error_code: str | None,
+        started_at: datetime,
+        ended_at: datetime,
+    ) -> None:
+        self._ensure_open()
+        if (
+            type(provider_id) is not str
+            or not provider_id
+            or type(market) is not Market
+            or type(symbol) is not str
+            or not symbol
+            or type(session_date) is not date
+            or type(attempt_number) is not int
+            or attempt_number <= 0
+            or type(status) is not str
+            or not status
+            or (error_code is not None and type(error_code) is not str)
+            or type(started_at) is not datetime
+            or started_at.tzinfo is None
+            or type(ended_at) is not datetime
+            or ended_at.tzinfo is None
+        ):
+            raise StoreError("record_symbol_attempt received invalid arguments")
+        attempt_id = tagged_sha256(
+            "symbol-fetch-attempt",
+            (
+                provider_id,
+                market.value,
+                symbol,
+                session_date.isoformat(),
+                attempt_number,
+            ),
+        )
+        try:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO symbol_fetch_attempts "
+                "(attempt_id, provider_id, market, symbol, session_date, "
+                "attempt_number, status, error_code, started_at, ended_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    attempt_id,
+                    provider_id,
+                    market.value,
+                    symbol,
+                    session_date.isoformat(),
+                    attempt_number,
+                    status,
+                    error_code,
+                    canonical_datetime(started_at),
+                    canonical_datetime(ended_at),
+                ],
+            )
+        except sqlite3.Error:
+            raise StoreError("symbol attempt record failed") from None
+
+    def has_completed_symbol(
+        self, provider_id: str, market: Market, symbol: str, session_date: date
+    ) -> bool:
+        self._ensure_open()
+        if (
+            type(provider_id) is not str
+            or not provider_id
+            or type(market) is not Market
+            or type(symbol) is not str
+            or not symbol
+            or type(session_date) is not date
+        ):
+            raise StoreError("has_completed_symbol received invalid arguments")
+        try:
+            row = self._connection.execute(
+                "SELECT 1 FROM symbol_fetch_attempts WHERE provider_id = ? "
+                "AND market = ? AND symbol = ? AND session_date = ? "
+                "AND status = 'SUCCESS' LIMIT 1",
+                [provider_id, market.value, symbol, session_date.isoformat()],
+            ).fetchone()
+        except sqlite3.Error:
+            raise StoreError("symbol attempt read failed") from None
+        return row is not None
 
     # ── internal helpers ────────────────────────────────────────────────────
 
